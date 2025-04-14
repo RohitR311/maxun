@@ -1,14 +1,16 @@
 import { Client } from 'minio';
 import Run from '../models/Run';
 
+// Initialize MinIO client
 const minioClient = new Client({
-  endPoint: process.env.MINIO_ENDPOINT ? process.env.MINIO_ENDPOINT : 'localhost',
+  endPoint: process.env.MINIO_ENDPOINT || 'localhost',
   port: parseInt(process.env.MINIO_PORT || '9000'),
   useSSL: false,
   accessKey: process.env.MINIO_ACCESS_KEY || 'minio-access-key',
   secretKey: process.env.MINIO_SECRET_KEY || 'minio-secret-key',
 });
 
+// Check connection and bucket existence
 minioClient.bucketExists('maxun-test')
   .then((exists) => {
     if (exists) {
@@ -19,9 +21,19 @@ minioClient.bucketExists('maxun-test')
   })
   .catch((err) => {
     console.error('Error connecting to MinIO:', err);
-  })
+  });
 
-async function createBucketWithPolicy(bucketName: string, policy = 'public-read') {
+// Constants for bucket names
+const SCREENSHOTS_BUCKET = 'maxun-run-screenshots';
+const CHECKPOINT_BUCKET = 'maxun-checkpoints';
+const SCRAPING_RESULTS_BUCKET = 'maxun-scraping-results';
+
+/**
+ * Creates a bucket with the specified policy if it doesn't exist
+ * @param bucketName The name of the bucket to create
+ * @param policy The policy to apply ('public-read' or undefined for private)
+ */
+async function createBucketWithPolicy(bucketName: string, policy = 'public-read'): Promise<void> {
   try {
     const bucketExists = await minioClient.bucketExists(bucketName);
     if (!bucketExists) {
@@ -49,15 +61,29 @@ async function createBucketWithPolicy(bucketName: string, policy = 'public-read'
     }
   } catch (error) {
     console.error('Error in bucket creation or policy application:', error);
+    throw error;
   }
 }
 
+// Initialize required buckets
+async function initializeBuckets(): Promise<void> {
+  await createBucketWithPolicy(SCREENSHOTS_BUCKET, 'public-read');
+  await createBucketWithPolicy(CHECKPOINT_BUCKET, undefined); // Private
+  await createBucketWithPolicy(SCRAPING_RESULTS_BUCKET, undefined); // Private
+}
 
+// Call initialization
+initializeBuckets().catch(err => {
+  console.error('Failed to initialize MinIO buckets:', err);
+});
 
+/**
+ * Service class for handling binary output (screenshots, etc.)
+ */
 class BinaryOutputService {
   private bucketName: string;
 
-  constructor(bucketName: string) {
+  constructor(bucketName: string = SCREENSHOTS_BUCKET) {
     this.bucketName = bucketName;
   }
 
@@ -132,26 +158,28 @@ class BinaryOutputService {
   }
 
   async uploadBinaryOutputToMinioBucket(run: Run, key: string, data: Buffer): Promise<void> {
-    await createBucketWithPolicy('maxun-run-screenshots', 'public-read');
-    const bucketName = 'maxun-run-screenshots';
+    await createBucketWithPolicy(this.bucketName, 'public-read');
     try {
-      console.log(`Uploading to bucket ${bucketName} with key ${key}`);
-      await minioClient.putObject(bucketName, key, data, data.length, { 'Content-Type': 'image/png' });
+      console.log(`Uploading to bucket ${this.bucketName} with key ${key}`);
+      await minioClient.putObject(this.bucketName, key, data, data.length, { 'Content-Type': 'image/png' });
       const plainRun = run.toJSON();
-      plainRun.binaryOutput[key] = `minio://${bucketName}/${key}`;
-      console.log(`Successfully uploaded to MinIO: minio://${bucketName}/${key}`);
+      
+      if (!plainRun.binaryOutput) {
+        plainRun.binaryOutput = {};
+      }
+      
+      plainRun.binaryOutput[key] = `minio://${this.bucketName}/${key}`;
+      console.log(`Successfully uploaded to MinIO: minio://${this.bucketName}/${key}`);
     } catch (error) {
-      console.error(`Error uploading to MinIO bucket: ${bucketName} with key: ${key}`, error);
+      console.error(`Error uploading to MinIO bucket: ${this.bucketName} with key: ${key}`, error);
       throw error;
     }
   }
 
   public async getBinaryOutputFromMinioBucket(key: string): Promise<Buffer> {
-    const bucketName = 'maxun-run-screenshots';
-
     try {
-      console.log(`Fetching from bucket ${bucketName} with key ${key}`);
-      const stream = await minioClient.getObject(bucketName, key);
+      console.log(`Fetching from bucket ${this.bucketName} with key ${key}`);
+      const stream = await minioClient.getObject(this.bucketName, key);
       return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         stream.on('data', (chunk) => chunks.push(chunk));
@@ -162,10 +190,250 @@ class BinaryOutputService {
         });
       });
     } catch (error) {
-      console.error(`Error fetching from MinIO bucket: ${bucketName} with key: ${key}`, error);
+      console.error(`Error fetching from MinIO bucket: ${this.bucketName} with key: ${key}`, error);
       throw error;
     }
   }
 }
 
-export { minioClient, BinaryOutputService };
+/**
+ * Service class for handling scraping checkpoints and results
+ */
+class ScrapingStateService {
+  /**
+   * Stores a checkpoint for a scraping job
+   * @param jobId - Unique identifier for the scraping job
+   * @param checkpointNumber - Checkpoint sequence number
+   * @param state - The state to checkpoint
+   * @returns Promise resolving to the checkpoint key
+   */
+  async storeCheckpoint(jobId: string, checkpointNumber: number, state: any): Promise<string> {
+    await createBucketWithPolicy(CHECKPOINT_BUCKET, undefined); // Ensure bucket exists (private)
+    
+    const key = `${jobId}/checkpoint-${checkpointNumber}-${Date.now()}.json`;
+    const data = Buffer.from(JSON.stringify(state));
+    
+    try {
+      await minioClient.putObject(
+        CHECKPOINT_BUCKET,
+        key, 
+        data,
+        data.length,
+        { 'Content-Type': 'application/json' }
+      );
+      
+      console.log(`Successfully stored checkpoint: minio://${CHECKPOINT_BUCKET}/${key}`);
+      return key;
+    } catch (error) {
+      console.error(`Error storing checkpoint for job ${jobId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieves a checkpoint for a scraping job
+   * @param key - The checkpoint key
+   * @returns Promise resolving to the checkpoint state
+   */
+  async getCheckpoint<T = any>(key: string): Promise<T> {
+    try {
+      const stream = await minioClient.getObject(CHECKPOINT_BUCKET, key);
+      
+      return new Promise((resolve, reject) => {
+        let dataString = '';
+        
+        stream.on('data', (chunk) => {
+          dataString += chunk.toString();
+        });
+        
+        stream.on('end', () => {
+          try {
+            const data = JSON.parse(dataString);
+            resolve(data as T);
+          } catch (parseError: any) {
+            reject(new Error(`Failed to parse checkpoint data: ${parseError.message}`));
+          }
+        });
+        
+        stream.on('error', (error) => {
+          console.error('Error reading checkpoint from MinIO:', error);
+          reject(error);
+        });
+      });
+    } catch (error) {
+      console.error(`Error retrieving checkpoint with key ${key}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Stores intermediate scraping results
+   * @param jobId - Unique identifier for the scraping job
+   * @param batchNumber - Batch sequence number
+   * @param data - The scraping results to store
+   * @returns Promise resolving to the storage key
+   */
+  async storeIntermediateResults(jobId: string, batchNumber: number, data: any): Promise<string> {
+    await createBucketWithPolicy(SCRAPING_RESULTS_BUCKET, undefined); // Ensure bucket exists (private)
+    
+    const key = `${jobId}/batch-${batchNumber}-${Date.now()}.json`;
+    const buffer = Buffer.from(JSON.stringify(data));
+    
+    try {
+      await minioClient.putObject(
+        SCRAPING_RESULTS_BUCKET,
+        key, 
+        buffer,
+        buffer.length,
+        { 'Content-Type': 'application/json' }
+      );
+      
+      console.log(`Successfully stored intermediate results: minio://${SCRAPING_RESULTS_BUCKET}/${key}`);
+      return key;
+    } catch (error) {
+      console.error(`Error storing intermediate results for job ${jobId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieves intermediate scraping results
+   * @param key - The storage key
+   * @returns Promise resolving to the scraping results
+   */
+  async getIntermediateResults<T = any>(key: string): Promise<T> {
+    try {
+      const stream = await minioClient.getObject(SCRAPING_RESULTS_BUCKET, key);
+      
+      return new Promise((resolve, reject) => {
+        let dataString = '';
+        
+        stream.on('data', (chunk) => {
+          dataString += chunk.toString();
+        });
+        
+        stream.on('end', () => {
+          try {
+            const data = JSON.parse(dataString);
+            resolve(data as T);
+          } catch (parseError: any) {
+            reject(new Error(`Failed to parse intermediate results: ${parseError.message}`));
+          }
+        });
+        
+        stream.on('error', (error) => {
+          console.error('Error reading intermediate results from MinIO:', error);
+          reject(error);
+        });
+      });
+    } catch (error) {
+      console.error(`Error retrieving intermediate results with key ${key}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Lists all intermediate results for a job
+   * @param jobId - Unique identifier for the scraping job
+   * @returns Promise resolving to an array of result keys
+   */
+  async listIntermediateResults(jobId: string): Promise<string[]> {
+    try {
+      const prefix = `${jobId}/`;
+      const stream = minioClient.listObjects(SCRAPING_RESULTS_BUCKET, prefix, true);
+      
+      return new Promise((resolve, reject) => {
+        const keys: string[] = [];
+        
+        stream.on('data', (obj) => {
+          if (obj.name) {
+            keys.push(obj.name);
+          }
+        });
+        
+        stream.on('end', () => {
+          resolve(keys);
+        });
+        
+        stream.on('error', (error) => {
+          console.error(`Error listing intermediate results for job ${jobId}:`, error);
+          reject(error);
+        });
+      });
+    } catch (error) {
+      console.error(`Error listing intermediate results for job ${jobId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Merges all intermediate results for a job
+   * @param jobId - Unique identifier for the scraping job
+   * @returns Promise resolving to the merged results
+   */
+  async mergeIntermediateResults<T = any>(jobId: string): Promise<T[]> {
+    try {
+      const keys = await this.listIntermediateResults(jobId);
+      
+      if (keys.length === 0) {
+        return [];
+      }
+      
+      // Create a Map to track unique items by a stable key
+      const uniqueResults = new Map<string, any>();
+      
+      // Process each batch
+      for (const key of keys) {
+        const batchResults = await this.getIntermediateResults<T[]>(key);
+        
+        if (Array.isArray(batchResults)) {
+          batchResults.forEach(item => {
+            // Create a unique key for deduplication (JSON stringify or hash)
+            const uniqueKey = JSON.stringify(item);
+            if (!uniqueResults.has(uniqueKey)) {
+              uniqueResults.set(uniqueKey, item);
+            }
+          });
+        }
+      }
+      
+      // Convert back to array
+      return Array.from(uniqueResults.values()) as T[];
+    } catch (error) {
+      console.error(`Error merging intermediate results for job ${jobId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Cleans up intermediate results for a job
+   * @param jobId - Unique identifier for the scraping job
+   * @returns Promise resolving to true if successful
+   */
+  async cleanupIntermediateResults(jobId: string): Promise<boolean> {
+    try {
+      const keys = await this.listIntermediateResults(jobId);
+      
+      if (keys.length === 0) {
+        return true;
+      }
+      
+      await minioClient.removeObjects(SCRAPING_RESULTS_BUCKET, keys);
+      console.log(`Successfully cleaned up ${keys.length} intermediate results for job ${jobId}`);
+      
+      return true;
+    } catch (error) {
+      console.error(`Error cleaning up intermediate results for job ${jobId}:`, error);
+      return false;
+    }
+  }
+}
+
+export { 
+  minioClient, 
+  BinaryOutputService, 
+  ScrapingStateService, 
+  SCREENSHOTS_BUCKET, 
+  CHECKPOINT_BUCKET, 
+  SCRAPING_RESULTS_BUCKET 
+};
