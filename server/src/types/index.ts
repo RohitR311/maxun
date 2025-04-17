@@ -9,6 +9,7 @@ export interface InterpreterSettings {
     maxRepeats: number;
     debug: boolean;
     params?: any;
+    runId?: string;
 }
 
 /**

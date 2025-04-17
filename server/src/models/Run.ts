@@ -3,6 +3,7 @@ import sequelize from '../storage/db';
 import Robot from './Robot';
 
 interface InterpreterSettings {
+  runId?: string;
   maxConcurrency: number;
   maxRepeats: number;
   debug: boolean;
