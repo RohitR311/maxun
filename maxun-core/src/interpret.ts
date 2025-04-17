@@ -48,6 +48,21 @@ interface InterpreterOptions {
   }>
 }
 
+interface ScrapingCheckpoint {
+  scrapingId: string;
+  pageUrl: string;
+  scrapedItems: string[]; 
+  scrollPosition: number;
+  results: Record<string, any>[];
+  isComplete: boolean;
+  paginationState: {
+    availableSelectors: string[];
+    currentHeight: number;
+    unchangedResultCounter: number;
+    visitedUrls: string[]; 
+  };
+}
+
 /**
  * Class for running the Smart Workflows.
  */
@@ -366,7 +381,7 @@ export default class Interpreter extends EventEmitter {
  * @param page Playwright Page object
  * @param steps Array of actions.
  */
-  private async carryOutSteps(page: Page, steps: What[]): Promise<void> {
+  public async carryOutSteps(page: Page, steps: What[]): Promise<void> {
     /**
      * Defines overloaded (or added) methods/actions usable in the workflow.
      * If a method overloads any existing method of the Page class, it accepts the same set
@@ -459,11 +474,12 @@ export default class Interpreter extends EventEmitter {
 
       scrapeList: async (config: { listSelector: string, fields: any, limit?: number, pagination: any }) => {
         await this.ensureScriptsLoaded(page);
+        
         if (!config.pagination) {
           const scrapeResults: Record<string, any>[] = await page.evaluate((cfg) => window.scrapeList(cfg), config);
           await this.options.serializableCallback(scrapeResults);
         } else {
-          const scrapeResults: Record<string, any>[] = await this.handlePagination(page, config);
+          const { results: scrapeResults } = await this.handlePagination(page, config);
           await this.options.serializableCallback(scrapeResults);
         }
       },
@@ -560,44 +576,68 @@ export default class Interpreter extends EventEmitter {
     }
   }
 
-  private async handlePagination(page: Page, config: { 
-    listSelector: string, 
-    fields: any, 
-    limit?: number, 
-    pagination: any 
-}) {
-    let allResults: Record<string, any>[] = [];
-    let previousHeight = 0;
-    let scrapedItems: Set<string> = new Set<string>();
-    let visitedUrls: Set<string> = new Set<string>();
+  public async handlePagination(
+    page: Page, 
+    config: { 
+      listSelector: string, 
+      fields: any, 
+      limit?: number, 
+      pagination: any 
+    },
+    scrapingId?: string,
+    checkpoint?: ScrapingCheckpoint | null,
+    timeoutMs: number = 30000
+  ): Promise<{ results: Record<string, any>[], checkpoint: ScrapingCheckpoint, completed: boolean }> {
+    const localScrapingId = scrapingId || `scraping-${Date.now()}`;
+    const startTime = Date.now();
+    
+    let allResults: Record<string, any>[] = checkpoint?.results || [];
+    let previousHeight = checkpoint?.paginationState?.currentHeight || 0;
+    
+    let scrapedItems: Set<string> = new Set<string>(checkpoint?.scrapedItems || []);
+    let visitedUrls: Set<string> = new Set<string>(checkpoint?.paginationState?.visitedUrls || []);
+    
     const MAX_RETRIES = 3;
     const RETRY_DELAY = 1000; // 1 second delay between retries
     const MAX_UNCHANGED_RESULTS = 5;
-
+  
+    if (checkpoint?.pageUrl && page.url() !== checkpoint.pageUrl) {
+      this.log(`Navigating to checkpoint URL: ${checkpoint.pageUrl}`, Level.LOG);
+      await page.goto(checkpoint.pageUrl, { waitUntil: 'networkidle' });
+    }
+    
+    if (checkpoint?.scrollPosition) {
+      this.log(`Restoring scroll position: ${checkpoint.scrollPosition}`, Level.LOG);
+      await page.evaluate((position) => {
+        window.scrollTo(0, position);
+      }, checkpoint.scrollPosition);
+      await page.waitForTimeout(1000); // Wait for scroll to complete
+    }
+  
     const debugLog = (message: string, ...args: any[]) => {
-        console.log(`[Page ${visitedUrls.size}] [URL: ${page.url()}] ${message}`, ...args);
+      this.log(`[ScrapingID: ${localScrapingId}] ${message} ${args.join(' ')}`, Level.LOG);
     };
-
+  
     const scrapeCurrentPage = async () => {
-        const results = await page.evaluate((cfg) => window.scrapeList(cfg), config);
-        const newResults = results.filter(item => {
-            const uniqueKey = JSON.stringify(item);
-            if (scrapedItems.has(uniqueKey)) return false;
-            scrapedItems.add(uniqueKey);
-            return true;
-        });
-        allResults = allResults.concat(newResults);
-        debugLog("Results collected:", allResults.length);
+      const results = await page.evaluate((cfg) => window.scrapeList(cfg), config);
+      const newResults = results.filter(item => {
+        const uniqueKey = JSON.stringify(item);
+        if (scrapedItems.has(uniqueKey)) return false;
+        scrapedItems.add(uniqueKey);
+        return true;
+      });
+      allResults = allResults.concat(newResults);
+      debugLog(`Results collected: ${allResults.length} total (${newResults.length} new)`);
     };
-
+  
     const checkLimit = () => {
-        if (config.limit && allResults.length >= config.limit) {
-            allResults = allResults.slice(0, config.limit);
-            return true;
-        }
-        return false;
+      if (config.limit && allResults.length >= config.limit) {
+        allResults = allResults.slice(0, config.limit);
+        return true;
+      }
+      return false;
     };
-
+  
     // Enhanced button finder with retry mechanism
     const findWorkingButton = async (selectors: string[]): Promise<{ 
       button: ElementHandle | null, 
@@ -609,9 +649,8 @@ export default class Interpreter extends EventEmitter {
       for (let i = 0; i < selectors.length; i++) {
         const selector = selectors[i];
         let retryCount = 0;
-        let selectorSuccess = false;
         
-        while (retryCount < MAX_RETRIES && !selectorSuccess) {
+        while (retryCount < MAX_RETRIES) {
           try {
             const button = await page.waitForSelector(selector, {
               state: 'attached',
@@ -646,122 +685,155 @@ export default class Interpreter extends EventEmitter {
         updatedSelectors 
       };
     };
-
-    const retryOperation = async (operation: () => Promise<boolean>, retryCount = 0): Promise<boolean> => {
-        try {
-            return await operation();
-        } catch (error) {
-            if (retryCount < MAX_RETRIES) {
-                debugLog(`Retrying operation. Attempt ${retryCount + 1} of ${MAX_RETRIES}`);
-                await page.waitForTimeout(RETRY_DELAY);
-                return retryOperation(operation, retryCount + 1);
-            }
-            debugLog(`Operation failed after ${MAX_RETRIES} retries`);
-            return false;
-        }
-    };
-
-    let availableSelectors = config.pagination.selector.split(',');
-    let unchangedResultCounter = 0;
-
+  
+    let availableSelectors = checkpoint?.paginationState?.availableSelectors || 
+                            (config.pagination.selector ? config.pagination.selector.split(',') : []);
+    let unchangedResultCounter = checkpoint?.paginationState?.unchangedResultCounter || 0;
+    let isComplete = checkpoint?.isComplete || false;
+  
+    debugLog(`Starting pagination handling. Timeout: ${timeoutMs}ms, Starting with ${allResults.length} results`);
+    if (checkpoint) {
+      debugLog(`Resuming from checkpoint. URL: ${checkpoint.pageUrl}, Scroll position: ${checkpoint.scrollPosition}`);
+    }
+  
+    if (isComplete) {
+      debugLog('Checkpoint indicates scraping is already complete.');
+      return {
+        results: allResults,
+        checkpoint: {
+          scrapingId: localScrapingId,
+          pageUrl: page.url(),
+          scrapedItems: Array.from(scrapedItems),
+          scrollPosition: checkpoint?.scrollPosition || 0,
+          results: allResults,
+          isComplete: true,
+          paginationState: {
+            availableSelectors,
+            currentHeight: previousHeight,
+            unchangedResultCounter,
+            visitedUrls: Array.from(visitedUrls)
+          }
+        },
+        completed: true
+      };
+    }
+  
     try {
-      while (true) {    
+      while (Date.now() - startTime < timeoutMs && !isComplete) {    
         switch (config.pagination.type) {
           case 'scrollDown': {
             let previousResultCount = allResults.length;
-
+  
             await scrapeCurrentPage();
             
             if (checkLimit()) {
-              return allResults;
+              debugLog('Reached configured limit. Marking as complete.');
+              isComplete = true;
+              break;
             }
-
+  
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
             await page.waitForTimeout(2000);
-
+  
             const currentHeight = await page.evaluate(() => document.body.scrollHeight);
             const currentResultCount = allResults.length;
             
             if (currentResultCount === previousResultCount) {
               unchangedResultCounter++;
+              debugLog(`No new results after scroll. Unchanged count: ${unchangedResultCounter}/${MAX_UNCHANGED_RESULTS}`);
+              
               if (unchangedResultCounter >= MAX_UNCHANGED_RESULTS) {
-                return allResults;
+                debugLog('Reached maximum unchanged results. Marking as complete.');
+                isComplete = true;
+                break;
               }
             } else {
               unchangedResultCounter = 0;
             }
             
             if (currentHeight === previousHeight) {
-              return allResults;
+              debugLog('Page height unchanged after scroll. Marking as complete.');
+              isComplete = true;
+              break;
             }
-
+  
             previousHeight = currentHeight;
+            
+            if (Date.now() - startTime > timeoutMs - 5000) {
+              debugLog("Approaching timeout, will save checkpoint and continue later");
+              break; 
+            }
             break;
           }
-
+  
           case 'scrollUp': {
             let previousResultCount = allResults.length;
-
+  
             await scrapeCurrentPage();
             
             if (checkLimit()) {
-              return allResults;
+              debugLog('Reached configured limit. Marking as complete.');
+              isComplete = true;
+              break;
             }
-
+  
             await page.evaluate(() => window.scrollTo(0, 0));
             await page.waitForTimeout(2000);
-
+  
             const currentTopHeight = await page.evaluate(() => document.documentElement.scrollTop);
             const currentResultCount = allResults.length;
             
             if (currentResultCount === previousResultCount) {
               unchangedResultCounter++;              
               if (unchangedResultCounter >= MAX_UNCHANGED_RESULTS) {
-                return allResults;
+                debugLog('Reached maximum unchanged results. Marking as complete.');
+                isComplete = true;
+                break;
               }
             } else {
               unchangedResultCounter = 0;
             }
-
+  
             if (currentTopHeight === 0) {
-              return allResults;
+              debugLog('Reached top of page. Marking as complete.');
+              isComplete = true;
+              break;
             }
-
+  
             previousHeight = currentTopHeight;
+            
+            if (Date.now() - startTime > timeoutMs - 5000) {
+              debugLog("Approaching timeout, will save checkpoint and continue later");
+              break;
+            }
             break;
           }
-
+  
           case 'clickNext': {
             const currentUrl = page.url();
             visitedUrls.add(currentUrl);
             
             await scrapeCurrentPage();
-            if (checkLimit()) return allResults;
+            
+            if (checkLimit()) {
+              debugLog('Reached configured limit. Marking as complete.');
+              isComplete = true;
+              break;
+            }
           
             const { button, workingSelector, updatedSelectors } = await findWorkingButton(availableSelectors);
             
             availableSelectors = updatedSelectors;
           
             if (!button || !workingSelector) {
-              // Final retry for navigation when no selectors work
-              const success = await retryOperation(async () => {
-                try {
-                  await page.evaluate(() => window.history.forward());
-                  const newUrl = page.url();
-                  return !visitedUrls.has(newUrl);
-                } catch {
-                  return false;
-                }
-              });
-                
-              if (!success) return allResults;
+              debugLog('No pagination button found. Marking as complete.');
+              isComplete = true;
               break;
             }
           
             let retryCount = 0;
             let paginationSuccess = false;
             
-            // Capture basic content signature before click
             const captureContentSignature = async () => {
               return await page.evaluate((selector) => {
                 const items = document.querySelectorAll(selector);
@@ -783,23 +855,19 @@ export default class Interpreter extends EventEmitter {
                     page.waitForNavigation({ 
                       waitUntil: 'networkidle',
                       timeout: 15000 
-                    }).catch(e => {
-                      throw e; 
-                    }),
+                    }).catch(e => { throw e; }),
                     button.click()
                   ]);
                   debugLog("Navigation successful after regular click");
                   paginationSuccess = true;
                 } catch (navError) {
-                  debugLog("Regular click with navigation failed, trying dispatch event with navigation");
+                  debugLog("Regular click with navigation failed, trying dispatch event");
                   try {
                     await Promise.all([
                       page.waitForNavigation({ 
                         waitUntil: 'networkidle',
                         timeout: 15000 
-                      }).catch(e => {
-                        throw e; 
-                      }),
+                      }).catch(e => { throw e; }),
                       button.dispatchEvent('click')
                     ]);
                     debugLog("Navigation successful after dispatch event");
@@ -849,126 +917,171 @@ export default class Interpreter extends EventEmitter {
             }
           
             if (!paginationSuccess) {
-              debugLog(`Pagination failed after ${MAX_RETRIES} attempts`);
-              return allResults;
+              debugLog(`Pagination failed after ${MAX_RETRIES} attempts. Marking as complete.`);
+              isComplete = true;
+              break;
+            }
+            
+            // Check if we're approaching timeout
+            if (Date.now() - startTime > timeoutMs - 5000) {
+              debugLog("Approaching timeout, will save checkpoint and continue later");
+              break;
             }
             
             break;
           }
-
+  
           case 'clickLoadMore': {
             await scrapeCurrentPage();
-            if (checkLimit()) return allResults;
             
-            let loadMoreCounter = 0;
-            let previousResultCount = allResults.length;
-            let noNewItemsCounter = 0;
-            const MAX_NO_NEW_ITEMS = 2;
+            if (checkLimit()) {
+              debugLog('Reached configured limit. Marking as complete.');
+              isComplete = true;
+              break;
+            }
             
-            while (true) {
-              // Find working button with retry mechanism
-              const { button: loadMoreButton, workingSelector, updatedSelectors } = await findWorkingButton(availableSelectors);
-
-              availableSelectors = updatedSelectors;
-              
-              if (!workingSelector || !loadMoreButton) {
-                debugLog('No working Load More selector found after retries');
-                return allResults;
-              }
-          
-              // Implement retry mechanism for clicking the button
-              let retryCount = 0;
-              let clickSuccess = false;
-          
-              while (retryCount < MAX_RETRIES && !clickSuccess) {
+            // Find Load More button
+            const { button: loadMoreButton, workingSelector, updatedSelectors } = await findWorkingButton(availableSelectors);
+  
+            availableSelectors = updatedSelectors;
+            
+            if (!workingSelector || !loadMoreButton) {
+              debugLog('No working Load More selector found. Marking as complete.');
+              isComplete = true;
+              break;
+            }
+        
+            // Try to click the button
+            let retryCount = 0;
+            let clickSuccess = false;
+        
+            while (retryCount < MAX_RETRIES && !clickSuccess) {
+              try {
                 try {
-                  try {
-                    await loadMoreButton.click();
-                    clickSuccess = true;
-                  } catch (error) {
-                    debugLog(`Regular click failed on attempt ${retryCount + 1}. Trying DispatchEvent`);
-                    
-                    // If regular click fails, try dispatchEvent
-                    try {
-                      await loadMoreButton.dispatchEvent('click');
-                      clickSuccess = true;
-                    } catch (dispatchError) {
-                      debugLog(`DispatchEvent failed on attempt ${retryCount + 1}.`);
-                      throw dispatchError; // Propagate error to trigger retry
-                    }
-                  }
-          
-                  if (clickSuccess) {
-                    await page.waitForTimeout(1000);
-                    loadMoreCounter++;
-                    debugLog(`Successfully clicked Load More button (${loadMoreCounter} times)`);
-                  }
+                  await loadMoreButton.click();
+                  clickSuccess = true;
                 } catch (error) {
-                  debugLog(`Click attempt ${retryCount + 1} failed completely.`);
-                  retryCount++;
+                  debugLog(`Regular click failed on attempt ${retryCount + 1}. Trying DispatchEvent`);
                   
-                  if (retryCount < MAX_RETRIES) {
-                    debugLog(`Retrying click - attempt ${retryCount + 1} of ${MAX_RETRIES}`);
-                    await page.waitForTimeout(RETRY_DELAY);
+                  // If regular click fails, try dispatchEvent
+                  try {
+                    await loadMoreButton.dispatchEvent('click');
+                    clickSuccess = true;
+                  } catch (dispatchError) {
+                    debugLog(`DispatchEvent failed on attempt ${retryCount + 1}.`);
+                    throw dispatchError; // Propagate error to trigger retry
                   }
                 }
-              }
-          
-              if (!clickSuccess) {
-                debugLog(`Load More clicking failed after ${MAX_RETRIES} attempts`);
-                return allResults;
-              }
-          
-              // Wait for content to load and check scroll height
-              await page.waitForTimeout(2000);
-              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-              await page.waitForTimeout(2000);
-          
-              const currentHeight = await page.evaluate(() => document.body.scrollHeight);
-              const heightChanged = currentHeight !== previousHeight;
-              previousHeight = currentHeight;
-              
-              await scrapeCurrentPage();
-              
-              const currentResultCount = allResults.length;
-              const newItemsAdded = currentResultCount > previousResultCount;
-                          
-              if (!newItemsAdded) {
-                noNewItemsCounter++;
-                debugLog(`No new items added after click (${noNewItemsCounter}/${MAX_NO_NEW_ITEMS})`);
-                
-                if (noNewItemsCounter >= MAX_NO_NEW_ITEMS) {
-                  debugLog(`Stopping after ${MAX_NO_NEW_ITEMS} clicks with no new items`);
-                  return allResults;
+        
+                if (clickSuccess) {
+                  await page.waitForTimeout(1000);
+                  debugLog(`Successfully clicked Load More button`);
                 }
-              } else {
-                noNewItemsCounter = 0;
-                previousResultCount = currentResultCount;
-              }
-              
-              if (checkLimit()) return allResults;     
-              
-              if (!heightChanged) {
-                debugLog('No more items loaded after Load More');
-                return allResults;
+              } catch (error) {
+                debugLog(`Click attempt ${retryCount + 1} failed completely.`);
+                retryCount++;
+                
+                if (retryCount < MAX_RETRIES) {
+                  debugLog(`Retrying click - attempt ${retryCount + 1} of ${MAX_RETRIES}`);
+                  await page.waitForTimeout(RETRY_DELAY);
+                }
               }
             }
+        
+            if (!clickSuccess) {
+              debugLog(`Load More clicking failed after ${MAX_RETRIES} attempts. Marking as complete.`);
+              isComplete = true;
+              break;
+            }
+        
+            // Wait for content to load and check scroll height
+            await page.waitForTimeout(2000);
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await page.waitForTimeout(2000);
+        
+            const currentHeight = await page.evaluate(() => document.body.scrollHeight);
+            const heightChanged = currentHeight !== previousHeight;
+            previousHeight = currentHeight;
+            
+            await scrapeCurrentPage();
+            
+            const currentResultCount = allResults.length;
+            const previousResultCount = currentResultCount - (allResults.length - currentResultCount);
+            const newItemsAdded = currentResultCount > previousResultCount;
+                        
+            if (!newItemsAdded) {
+              unchangedResultCounter++;
+              debugLog(`No new items added after click (${unchangedResultCounter}/${MAX_UNCHANGED_RESULTS})`);
+              
+              if (unchangedResultCounter >= MAX_UNCHANGED_RESULTS) {
+                debugLog(`Stopping after ${MAX_UNCHANGED_RESULTS} clicks with no new items. Marking as complete.`);
+                isComplete = true;
+                break;
+              }
+            } else {
+              unchangedResultCounter = 0;
+            }
+            
+            if (checkLimit()) {
+              debugLog('Reached configured limit. Marking as complete.');
+              isComplete = true;
+              break;
+            }
+            
+            if (!heightChanged) {
+              debugLog('No more items loaded after Load More. Marking as complete.');
+              isComplete = true;
+              break;
+            }
+            
+            if (Date.now() - startTime > timeoutMs - 5000) {
+              debugLog("Approaching timeout, will save checkpoint and continue later");
+              break;
+            }
+            break;
           }
-
+  
           default: {
             await scrapeCurrentPage();
-            return allResults;
+            debugLog('Using default pagination type. Marking as complete.');
+            isComplete = true;
+            break;
           }
         }
-
-        if (checkLimit()) break;
+  
+        if (isComplete || checkLimit()) break;
       }
     } catch (error) {
-        debugLog(`Fatal error: ${error.message}`);
-        return allResults;
+      debugLog(`Fatal error during pagination: ${error.message}`);
     }
-
-    return allResults;
+  
+    const currentScrollPosition = await page.evaluate(() => window.scrollY);
+    
+    const timedOut = Date.now() - startTime >= timeoutMs && !isComplete;
+    if (timedOut) {
+      debugLog("Scraping session timed out after 30 seconds. Creating checkpoint for continuation.");
+    }
+    
+    const newCheckpoint: ScrapingCheckpoint = {
+      scrapingId: localScrapingId,
+      pageUrl: page.url(),
+      scrapedItems: Array.from(scrapedItems),
+      scrollPosition: currentScrollPosition,
+      results: allResults,
+      isComplete,
+      paginationState: {
+        availableSelectors,
+        currentHeight: previousHeight,
+        unchangedResultCounter,
+        visitedUrls: Array.from(visitedUrls)
+      }
+    };
+  
+    return {
+      results: allResults,
+      checkpoint: newCheckpoint,
+      completed: isComplete
+    };
   }
 
   private getMatchingActionId(workflow: Workflow, pageState: PageState, usedActions: string[]) {
