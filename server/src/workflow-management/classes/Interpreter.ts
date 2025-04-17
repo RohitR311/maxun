@@ -4,6 +4,8 @@ import { Socket } from "socket.io";
 import { Page } from "playwright";
 import { InterpreterSettings } from "../../types";
 import { decrypt } from "../../utils/auth";
+import { v4 as uuidv4 } from 'uuid';
+import { ScrapingStateService } from "../../storage/mino";
 
 /**
  * Decrypts any encrypted inputs in the workflow. If checkLimit is true, it will also handle the limit validation for scrapeList action.
@@ -104,6 +106,11 @@ export class WorkflowInterpreter {
   private breakpoints: boolean[] = [];
 
   /**
+   * Service for handling scraping state and checkpoints
+   */
+  private scrapingStateService: ScrapingStateService;
+
+  /**
    * Callback to resume the interpretation after a pause.
    * @private
    */
@@ -116,6 +123,7 @@ export class WorkflowInterpreter {
    */
   constructor(socket: Socket) {
     this.socket = socket;
+    this.scrapingStateService = new ScrapingStateService();
   }
 
   /**
@@ -251,9 +259,82 @@ export class WorkflowInterpreter {
   }
 
   /**
-   * Interprets the recording as a run.
+   * Executes a scrapeList action in a checkpoint-based manner with 30-second intervals
+   * @param page Current browser page
+   * @param action The scrapeList action configuration
+   * @param runId ID of the current run
+   * @returns Promise resolving to the merged scraping results
+   */
+  private async executeCheckpointedScraping(
+    page: Page,
+    action: any,
+    runId: string
+  ): Promise<any[]> {
+    if (!action || !action.args || !action.args[0]) {
+      logger.log('error', 'Invalid scraping action configuration');
+      return [];
+    }
+
+    const scrapingId = `scraping-${uuidv4()}`;
+    logger.log('info', `Starting checkpointed scraping with ID: ${scrapingId}`);
+    
+    let checkpoint = await this.scrapingStateService.getLatestScrapingCheckpoint(runId, scrapingId);
+    let isComplete = false;
+    let batchNumber = 0;
+
+    while (!isComplete) {
+      try {
+        if (!this.interpreter) {
+          throw new Error('Interpreter is not initialized.');
+        }
+        const { results, checkpoint: newCheckpoint, completed } = await this.interpreter.handlePagination(
+          page, 
+          action.args[0], 
+          scrapingId,
+          checkpoint,
+          30000 
+        );
+        
+        await this.scrapingStateService.storeScrapingResults(runId, scrapingId, results);
+        
+        await this.scrapingStateService.storeScrapingCheckpoint(runId, scrapingId, newCheckpoint);
+        
+        isComplete = completed;
+        checkpoint = newCheckpoint;
+        batchNumber++;
+        
+        if (completed) {
+          break;
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.log('error', `Error in scraping interval: ${errorMessage}`);
+        
+        this.socket.emit('scrapingProgress', {
+          scrapingId,
+          status: 'error',
+          message: `Error in batch ${batchNumber + 1}: ${errorMessage}`
+        });
+        
+        batchNumber++;
+      }
+    }
+    
+    try {
+      const mergedResults = await this.scrapingStateService.mergeScrapingResults(runId, scrapingId);
+      return mergedResults;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.log('error', `Error merging scraping results: ${errorMessage}`);
+      return [];
+    }
+  }
+
+  /**
+   * Interprets the recording as a run with checkpoint-based scraping.
    * @param workflow The workflow to interpret.
    * @param page The page instance used to interact with the browser.
+   * @param updatePageOnPause Function to update the page on pause.
    * @param settings The settings to use for the interpretation.
    */
   public InterpretRecording = async (
@@ -265,7 +346,12 @@ export class WorkflowInterpreter {
     const params = settings.params ? settings.params : null;
     delete settings.params;
 
+    const runId = settings.runId || uuidv4();
+    logger.log('info', `Starting interpretation for run: ${runId}`);
+
     const processedWorkflow = processWorkflow(workflow);
+
+    let originalScrapeList: Function | null = null;
 
     const options = {
       ...settings,
@@ -292,6 +378,33 @@ export class WorkflowInterpreter {
     const interpreter = new Interpreter(processedWorkflow, options);
     this.interpreter = interpreter;
 
+    if (interpreter.carryOutSteps) {
+      originalScrapeList = interpreter.carryOutSteps;
+      
+      interpreter.carryOutSteps = async (page, steps) => {
+        for (let i = 0; i < steps.length; i++) {
+          const step = steps[i];
+          
+          if (step.action === 'scrapeList') {
+            logger.log('info', 'Intercepting scrapeList action for checkpoint-based execution');
+            
+            try {
+              const results = await this.executeCheckpointedScraping(page, step, runId);
+              
+              if (options.serializableCallback) {
+                options.serializableCallback(results);
+              }
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              logger.log('error', `Error in checkpoint-based scraping: ${errorMessage}`);
+            }
+          } else if (originalScrapeList) {
+            await originalScrapeList.call(interpreter, page, [step]);
+          }
+        }
+      };
+    }
+
     interpreter.on('flag', async (page, resume) => {
       if (this.activeId !== null && this.breakpoints[this.activeId]) {
         logger.log('debug', `breakpoint hit id: ${this.activeId}`);
@@ -312,8 +425,8 @@ export class WorkflowInterpreter {
     const status = await interpreter.run(page, params);
 
     const lastArray = this.serializableData.length > 1
-    ? [this.serializableData[this.serializableData.length - 1]]
-    : this.serializableData;
+      ? [this.serializableData[this.serializableData.length - 1]]
+      : this.serializableData;
 
     const result = {
       log: this.debugMessages,
@@ -332,7 +445,7 @@ export class WorkflowInterpreter {
       }, {})
     }
 
-    logger.log('debug', `Interpretation finished`);
+    logger.log('debug', `Interpretation finished for run: ${runId}`);
     this.clearState();
     return result;
   }
