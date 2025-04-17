@@ -4,7 +4,7 @@ import { createRemoteBrowserForRun, getActiveBrowserIdByState } from "../browser
 import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { browserPool } from "../server";
-import { uuid } from "uuidv4";
+import { v4 as uuid } from "uuid";
 import moment from 'moment-timezone';
 import cron from 'node-cron';
 import { getDecryptedProxyConfig } from './proxy';
@@ -16,8 +16,16 @@ import { computeNextRun } from '../utils/schedule';
 import { capture } from "../utils/analytics";
 import { encrypt, decrypt } from '../utils/auth';
 import { WorkflowFile } from 'maxun-core';
-import { cancelScheduledWorkflow, scheduleWorkflow } from '../schedule-worker';
-import { pgBoss } from '../pgboss-worker';
+import { 
+  processRunExecution, 
+  interpretWorkflowForRun, 
+  stopWorkflowInterpretation 
+} from '../pgboss-worker';
+import { 
+  cancelScheduledWorkflow, 
+  scheduleWorkflow 
+} from '../schedule-worker';
+
 chromium.use(stealthPlugin());
 
 export const router = Router();
@@ -512,7 +520,7 @@ router.delete('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res)
  * PUT endpoint for starting a remote browser instance and saving run metadata to the storage.
  * Making it ready for interpretation and returning a runId.
  * 
- * If the user has reached their browser limit, the run will be queued using PgBoss.
+ * Modified to work without pgBoss and support checkpoint-based scraping.
  */
 router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
@@ -557,6 +565,12 @@ router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) =>
       // User has available browser slots, create it directly
       const id = createRemoteBrowserForRun(req.user.id);
 
+      // Add runId to interpreter settings for checkpoint-based scraping
+      const interpreterSettings = {
+        ...req.body,
+        runId // Set runId for checkpoint management
+      };
+
       const run = await Run.create({
         status: 'running',
         name: recording.recording_meta.name,
@@ -565,7 +579,7 @@ router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) =>
         startedAt: new Date().toLocaleString(),
         finishedAt: '',
         browserId: id,
-        interpreterSettings: req.body,
+        interpreterSettings,
         log: '',
         runId,
         runByUserId: req.user.id,
@@ -595,8 +609,11 @@ router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) =>
             robotMetaId: recording.recording_meta.id,
             startedAt: new Date().toLocaleString(),
             finishedAt: '',
-            browserId: browserId,  // Random will be updated later
-            interpreterSettings: req.body,
+            browserId: browserId,
+            interpreterSettings: {
+              ...req.body,
+              runId // Set runId for checkpoint management
+            },
             log: 'Run queued - waiting for available browser slot',
             runId,
             runByUserId: req.user.id,
@@ -655,11 +672,13 @@ function AddGeneratedFlags(workflow: WorkflowFile) {
 };
 
 /**
- * PUT endpoint for finishing a run and saving it to the storage.
+ * POST endpoint for executing a run - modified to use direct execution instead of pgBoss
  */
 router.post('/runs/run/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
-    if (!req.user) { return res.status(401).send({ error: 'Unauthorized' }); }
+    if (!req.user) { 
+      return res.status(401).send({ error: 'Unauthorized' }); 
+    }
 
     const run = await Run.findOne({ where: { runId: req.params.id } });
     if (!run) {
@@ -674,21 +693,37 @@ router.post('/runs/run/:id', requireSignIn, async (req: AuthenticatedRequest, re
     }
 
     try {
-      const userQueueName = `execute-run-user-${req.user.id}`;
-
-      // Queue the execution job
-      await pgBoss.createQueue(userQueueName);
-      
-      const jobId = await pgBoss.send(userQueueName, {
+      // Execute the run directly without pgBoss
+      const result = await processRunExecution({
         userId: req.user.id,
         runId: req.params.id,
         browserId: plainRun.browserId
       });
       
-      logger.log('info', `Queued run execution job with ID: ${jobId} for run: ${req.params.id}`);
-    } catch (queueError: any) {
-      logger.log('error', `Failed to queue run execution`);
+      return res.send(result.success);
+    } catch (error) {
+      const { message } = error instanceof Error ? error : new Error('Unknown error');
+      logger.log('error', `Error executing run with id ${req.params.id}: ${message}`);
       
+      // If error occurs, set run status to failed
+      await run.update({
+        status: 'failed',
+        finishedAt: new Date().toLocaleString(),
+        log: `Failed: ${message}`
+      });
+      
+      capture(
+        'maxun-oss-run-created-manual',
+        {
+          runId: req.params.id,
+          user_id: req.user?.id,
+          created_at: new Date().toISOString(),
+          status: 'failed',
+          error_message: message,
+        }
+      );
+      
+      return res.send(false);
     }
   } catch (e) {
     const { message } = e as Error;
@@ -868,7 +903,7 @@ router.delete('/schedule/:id', requireSignIn, async (req: AuthenticatedRequest, 
       return res.status(404).json({ error: 'Robot not found' });
     }
 
-    // Cancel the scheduled job in PgBoss
+    // Cancel the scheduled job in the scheduler
     try {
       await cancelScheduledWorkflow(id);
     } catch (error) {
@@ -903,18 +938,30 @@ router.delete('/schedule/:id', requireSignIn, async (req: AuthenticatedRequest, 
  */
 router.post('/runs/abort/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
-    if (!req.user) { return res.status(401).send({ error: 'Unauthorized' }); }
-      const run = await Run.findOne({ where: { 
-      runId: req.params.id,
-      runByUserId: req.user.id,
-    } });
+    if (!req.user) { 
+      return res.status(401).send({ error: 'Unauthorized' }); 
+    }
+    
+    const run = await Run.findOne({ 
+      where: { 
+        runId: req.params.id,
+        runByUserId: req.user.id,
+      } 
+    });
+    
     if (!run) {
       return res.status(404).send(false);
     }
+    
     const plainRun = run.toJSON();
 
     const browser = browserPool.getRemoteBrowser(plainRun.browserId);
-    const currentLog = browser?.interpreter.debugMessages.join('/n');
+    if (!browser) {
+      return res.status(404).send({ error: 'Browser not found' });
+    }
+    
+    // Gather current execution state before aborting
+    const currentLog = browser?.interpreter.debugMessages.join('\n');
     const serializableOutput = browser?.interpreter.serializableData.reduce((reducedObject, item, index) => {
       return {
         [`item-${index}`]: item,
@@ -927,8 +974,12 @@ router.post('/runs/abort/:id', requireSignIn, async (req: AuthenticatedRequest, 
         ...reducedObject,
       }
     }, {});
+    
+    // Stop the interpreter
+    await browser?.interpreter.stopInterpretation();
+    
+    // Update the run status to aborted
     await run.update({
-      ...run,
       status: 'aborted',
       finishedAt: new Date().toLocaleString(),
       browserId: plainRun.browserId,
@@ -936,10 +987,11 @@ router.post('/runs/abort/:id', requireSignIn, async (req: AuthenticatedRequest, 
       serializableOutput,
       binaryOutput,
     });
+    
     return res.send(true);
   } catch (e) {
     const { message } = e as Error;
-    logger.log('info', `Error while running a robot with name: ${req.params.fileName}_${req.params.runId}.json`);
+    logger.log('error', `Error while aborting run ${req.params.id}: ${message}`);
     return res.send(false);
   }
 });
