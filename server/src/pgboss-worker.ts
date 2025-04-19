@@ -1,12 +1,14 @@
 /**
  * Direct run execution without PgBoss, supporting checkpoint-based scraping
+ * Updated to work with Redis-backed BrowserPool and asynchronous operations
  */
 import logger from './logger';
 import {
-  initializeRemoteBrowserForRecording,
+  createRemoteBrowserForRun,
   destroyRemoteBrowser,
   interpretWholeWorkflow,
   stopRunningInterpretation,
+  getRemoteBrowserRemainingTime,
 } from './browser-management/controller';
 import { WorkflowFile } from 'maxun-core';
 import Run from './models/Run';
@@ -20,6 +22,15 @@ import { airtableUpdateTasks, processAirtableUpdates } from './workflow-manageme
 import { RemoteBrowser } from './browser-management/classes/RemoteBrowser';
 import { io as serverIo } from "./server";
 import PgBoss, { Job } from 'pg-boss';
+import { redisClient } from './storage/connection';
+
+// Redis keys for tracking run execution
+const REDIS_KEYS = {
+  RUN_STATUS: (runId: string) => `run:${runId}:status`,
+  RUN_EXECUTION: (runId: string) => `run:${runId}:execution`,
+  RUN_QUEUE: 'runs:queue',
+  USER_RUNS: (userId: string) => `user:${userId}:runs`,
+};
 
 const pgBossConnectionString = `postgres://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`;
 const pgBoss = new PgBoss({connectionString: pgBossConnectionString });
@@ -97,7 +108,7 @@ async function checkAndProcessQueuedRun(userId: string, browserId: string): Prom
     }
     
     // Reset the browser state before next run
-    const browser = browserPool.getRemoteBrowser(browserId);
+    const browser = await browserPool.getRemoteBrowser(browserId);
     if (browser) {
       logger.log('info', `Resetting browser state for browser ${browserId} before next run`);
       await resetBrowserState(browser);
@@ -108,6 +119,9 @@ async function checkAndProcessQueuedRun(userId: string, browserId: string): Prom
       status: 'running',
       log: 'Run started - using browser from previous run'
     });
+    
+    // Update run status in Redis
+    await redisClient.set(REDIS_KEYS.RUN_STATUS(queuedRun.runId), 'running');
     
     // Process the run directly
     processRunExecution({
@@ -132,10 +146,23 @@ export async function processRunExecution(data: ExecuteRunData) {
   try {
     logger.log('info', `Processing run execution for runId: ${data.runId}, browserId: ${data.browserId}`);
     
+    // Store execution status in Redis
+    await redisClient.hmset(REDIS_KEYS.RUN_EXECUTION(data.runId), {
+      status: 'running',
+      userId: data.userId,
+      browserId: data.browserId,
+      startedAt: Date.now().toString()
+    });
+    
     // Find the run
     const run = await Run.findOne({ where: { runId: data.runId } });
     if (!run) {
       logger.log('error', `Run ${data.runId} not found in database`);
+      
+      // Clean up Redis data
+      await redisClient.del(REDIS_KEYS.RUN_EXECUTION(data.runId));
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(data.runId), 'failed');
+      
       return { success: false };
     }
 
@@ -153,6 +180,10 @@ export async function processRunExecution(data: ExecuteRunData) {
         log: 'Failed: Recording not found',
       });
       
+      // Update Redis status
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(data.runId), 'failed');
+      await redisClient.del(REDIS_KEYS.RUN_EXECUTION(data.runId));
+      
       // Check for queued runs even if this one failed
       await checkAndProcessQueuedRun(data.userId, data.browserId);
       
@@ -160,11 +191,22 @@ export async function processRunExecution(data: ExecuteRunData) {
     }
 
     // Get the browser and execute the run
-    const browser = browserPool.getRemoteBrowser(plainRun.browserId);
+    const browser = await browserPool.getRemoteBrowser(plainRun.browserId);
     let currentPage = browser?.getCurrentPage();
     
     if (!browser || !currentPage) {
       logger.log('error', `Browser or page not available for run ${data.runId}`);
+      
+      // Update run status to failed
+      await run.update({
+        status: 'failed',
+        finishedAt: new Date().toLocaleString(),
+        log: 'Failed: Browser or page not available',
+      });
+      
+      // Update Redis status
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(data.runId), 'failed');
+      await redisClient.del(REDIS_KEYS.RUN_EXECUTION(data.runId));
       
       // Even if this run failed, check for queued runs
       await checkAndProcessQueuedRun(data.userId, data.browserId);
@@ -173,6 +215,25 @@ export async function processRunExecution(data: ExecuteRunData) {
     }
 
     try {
+      // Check if browser session has enough time remaining
+      const remainingTime = await getRemoteBrowserRemainingTime(plainRun.browserId);
+      if (remainingTime !== null && remainingTime < 60000) { // Less than 1 minute
+        logger.log('error', `Browser session will expire soon for run ${data.runId}`);
+        
+        // Update run status to failed
+        await run.update({
+          status: 'failed',
+          finishedAt: new Date().toLocaleString(),
+          log: 'Failed: Browser session will expire soon',
+        });
+        
+        // Update Redis status
+        await redisClient.set(REDIS_KEYS.RUN_STATUS(data.runId), 'failed');
+        await redisClient.del(REDIS_KEYS.RUN_EXECUTION(data.runId));
+        
+        return { success: false };
+      }
+      
       // Reset the browser state before executing this run
       await resetBrowserState(browser);
       
@@ -200,6 +261,13 @@ export async function processRunExecution(data: ExecuteRunData) {
         log: interpretationInfo.log.join('\n'),
         serializableOutput: interpretationInfo.serializableOutput,
         binaryOutput: uploadedBinaryOutput,
+      });
+      
+      // Update Redis status
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(data.runId), 'success');
+      await redisClient.hmset(REDIS_KEYS.RUN_EXECUTION(data.runId), {
+        status: 'completed',
+        finishedAt: Date.now().toString()
       });
 
       // Track extraction metrics
@@ -287,6 +355,14 @@ export async function processRunExecution(data: ExecuteRunData) {
         log: `Failed: ${executionError.message}`,
       });
       
+      // Update Redis status
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(data.runId), 'failed');
+      await redisClient.hmset(REDIS_KEYS.RUN_EXECUTION(data.runId), {
+        status: 'failed',
+        error: executionError.message,
+        finishedAt: Date.now().toString()
+      });
+      
       // Check for queued runs before destroying the browser
       const queuedRunProcessed = await checkAndProcessQueuedRun(data.userId, plainRun.browserId);
       
@@ -318,6 +394,19 @@ export async function processRunExecution(data: ExecuteRunData) {
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.log('error', `Failed to process run execution: ${errorMessage}`);
+    
+    // Update Redis status on top-level error
+    try {
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(data.runId), 'failed');
+      await redisClient.hmset(REDIS_KEYS.RUN_EXECUTION(data.runId), {
+        status: 'failed',
+        error: errorMessage,
+        finishedAt: Date.now().toString()
+      });
+    } catch (redisError) {
+      logger.log('error', `Failed to update Redis on run error: ${redisError}`);
+    }
+    
     return { success: false };
   }
 }
@@ -325,10 +414,10 @@ export async function processRunExecution(data: ExecuteRunData) {
 /**
  * Handle browser initialization (no pgBoss)
  */
-export function initializeRemoteBrowserForRun(userId: string): string {
+export async function initializeRemoteBrowserForRun(userId: string): Promise<string> {
   try {
     logger.log('info', `Starting browser initialization for user: ${userId}`);
-    const browserId = initializeRemoteBrowserForRecording(userId);
+    const browserId = await createRemoteBrowserForRun(userId);
     logger.log('info', `Browser initialized with ID: ${browserId}`);
     return browserId;
   } catch (error: unknown) {
@@ -386,17 +475,75 @@ export async function stopWorkflowInterpretation(userId: string): Promise<boolea
   }
 }
 
+/**
+ * Get run status from Redis
+ */
+export async function getRunStatus(runId: string): Promise<string | null> {
+  try {
+    return await redisClient.get(REDIS_KEYS.RUN_STATUS(runId));
+  } catch (error) {
+    logger.log('error', `Failed to get run status from Redis: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Get run execution details from Redis
+ */
+export async function getRunExecutionDetails(runId: string): Promise<Record<string, string> | null> {
+  try {
+    return await redisClient.hgetall(REDIS_KEYS.RUN_EXECUTION(runId));
+  } catch (error) {
+    logger.log('error', `Failed to get run execution details from Redis: ${error}`);
+    return null;
+  }
+}
+
 // Initialize direct execution system (no workers needed without pgBoss)
-logger.log('info', 'Initializing direct run execution system (no pgBoss)');
+logger.log('info', 'Initializing direct run execution system with Redis tracking');
 
 // Handle graceful shutdown
 process.on('SIGTERM', async () => {
-  logger.log('info', 'SIGTERM received, shutting down...');
+  logger.log('info', 'SIGTERM received, cleaning up and shutting down...');
+  
+  try {
+    // Clean up any active run executions in Redis
+    const activeRuns = await redisClient.keys('run:*:execution');
+    for (const runKey of activeRuns) {
+      const runId = runKey.split(':')[1];
+      await redisClient.hmset(runKey, {
+        status: 'aborted',
+        error: 'Server shutdown',
+        finishedAt: Date.now().toString()
+      });
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(runId), 'aborted');
+    }
+  } catch (error) {
+    logger.log('error', `Error during shutdown cleanup: ${error}`);
+  }
+  
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  logger.log('info', 'SIGINT received, shutting down...');
+  logger.log('info', 'SIGINT received, cleaning up and shutting down...');
+  
+  try {
+    // Clean up any active run executions in Redis
+    const activeRuns = await redisClient.keys('run:*:execution');
+    for (const runKey of activeRuns) {
+      const runId = runKey.split(':')[1];
+      await redisClient.hmset(runKey, {
+        status: 'aborted',
+        error: 'Server shutdown',
+        finishedAt: Date.now().toString()
+      });
+      await redisClient.set(REDIS_KEYS.RUN_STATUS(runId), 'aborted');
+    }
+  } catch (error) {
+    logger.log('error', `Error during shutdown cleanup: ${error}`);
+  }
+  
   process.exit(0);
 });
 

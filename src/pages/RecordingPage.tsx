@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Grid } from '@mui/material';
 import { BrowserContent } from "../components/browser/BrowserContent";
 import { InterpretationLog } from "../components/run/InterpretationLog";
-import { startRecording, getActiveBrowserId } from "../api/recording";
+import { startRecording, getActiveBrowserId, stopRecording } from "../api/recording";
 import { RightSidePanel } from "../components/recorder/RightSidePanel";
 import { Loader } from "../components/ui/Loader";
 import { useSocketStore } from "../context/socket";
@@ -43,7 +43,7 @@ export const RecordingPage = ({ recordingName }: RecordingPageProps) => {
 
   const { setId, socket } = useSocketStore();
   const { setWidth } = useBrowserDimensionsStore();
-  const { browserId, setBrowserId, recordingId, recordingUrl, setRecordingUrl } = useGlobalInfoStore();
+  const { browserId, setBrowserId, recordingId, recordingUrl, setRecordingUrl, notify } = useGlobalInfoStore();
 
   const handleShowOutputData = useCallback(() => {
     setShowOutputData(true);
@@ -55,6 +55,42 @@ export const RecordingPage = ({ recordingName }: RecordingPageProps) => {
       index,
     });
   };
+
+  const handleSessionWarning = useCallback((data: { remainingTime: number; }) => {
+    console.log('Session warning received:', data);
+    
+    notify('warning', t('browser_recording.notifications.session_expiring', {
+      seconds: Math.floor(data.remainingTime)
+    }));
+  }, [notify, t]);
+
+  const handleSessionEnded = useCallback(async (data: any) => {    
+    if (browserId) {
+      await stopRecording(browserId);
+
+      notify('error', t('browser_recording.notifications.session_ended'));
+    
+      // Store notification for main window
+      const notificationData = {
+        type: 'error',
+        message: t('browser_recording.notifications.session_ended'),
+        timestamp: Date.now()
+      };
+      
+      window.sessionStorage.setItem('pendingNotification', JSON.stringify(notificationData));
+      
+      if (window.opener) {
+        window.opener.postMessage({
+          type: 'recording-notification',
+          notification: notificationData
+        }, '*');
+      }
+      
+      setBrowserId(null);
+
+      window.close();
+    } 
+  }, [notify, t, browserId, setBrowserId]);
 
   useEffect(() => changeBrowserDimensions(), [isLoaded])
 
@@ -135,6 +171,17 @@ export const RecordingPage = ({ recordingName }: RecordingPageProps) => {
     }
   }, [socket, handleLoaded]);
 
+  useEffect(() => {
+    if (socket) {
+      socket.on('sessionWarning', handleSessionWarning);
+      socket.on('sessionEnded', handleSessionEnded);
+      
+      return () => {
+        socket.off('sessionWarning', handleSessionWarning);
+        socket.off('sessionEnded', handleSessionEnded);
+      };
+    }
+  }, [socket, handleSessionWarning, handleSessionEnded]);
 
   return (
     <ActionProvider>

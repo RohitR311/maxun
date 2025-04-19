@@ -2,6 +2,7 @@
  * A set of functions handling reproduction of user input
  * on the remote browser instance as well as the generation of workflow pairs.
  * These functions are called by the client through socket communication.
+ * Updated to work with Redis-backed BrowserPool and asynchronous operations.
  */
 import { Socket } from 'socket.io';
 import { IncomingMessage } from 'http';
@@ -14,6 +15,7 @@ import { WorkflowGenerator } from "../workflow-management/classes/Generator";
 import { Page } from "playwright";
 import { throttle } from "../../../src/helpers/inputHelpers";
 import { CustomActions } from "../../../src/shared/types";
+import { getActiveBrowserIdByState } from '../browser-management/controller';
 
 interface AuthenticatedIncomingMessage extends IncomingMessage {
   user?: JwtPayload | string;
@@ -56,25 +58,32 @@ const handleWrapper = async (
         return;
     }
 
-    const id = browserPool.getActiveBrowserId(userId, "recording");
-    if (id) {
-        const activeBrowser = browserPool.getRemoteBrowser(id);
-        if (activeBrowser?.interpreter.interpretationInProgress() && !activeBrowser.interpreter.interpretationIsPaused) {
-            logger.log('debug', `Ignoring input, while interpretation is in progress`);
-            return;
-        }
-        const currentPage = activeBrowser?.getCurrentPage();
-        if (currentPage && activeBrowser) {
-            if (args) {
-                await handleCallback(activeBrowser.generator, currentPage, args);
+    try {
+        const id = await getActiveBrowserIdByState(userId, "recording");
+        if (id) {
+            const activeBrowser = await browserPool.getRemoteBrowser(id);
+            if (activeBrowser?.interpreter.interpretationInProgress() && !activeBrowser.interpreter.interpretationIsPaused) {
+                logger.log('debug', `Ignoring input, while interpretation is in progress`);
+                return;
+            }
+            const currentPage = activeBrowser?.getCurrentPage();
+            if (currentPage && activeBrowser) {
+                if (args) {
+                    await handleCallback(activeBrowser.generator, currentPage, args);
+                } else {
+                    await handleCallback(activeBrowser.generator, currentPage);
+                }
+                
+                // Update activity timestamp in Redis
+                await browserPool.setActiveBrowser(id, true);
             } else {
-                await handleCallback(activeBrowser.generator, currentPage);
+                logger.log('warn', `No active page for browser ${id}`);
             }
         } else {
-            logger.log('warn', `No active page for browser ${id}`);
+            logger.log('warn', `No active browser for user ${userId}`);
         }
-    } else {
-        logger.log('warn', `No active browser for id ${id}`);
+    } catch (error: any) {
+        logger.log('error', `Error handling user input: ${error.message}`);
     }
 }
 
@@ -501,6 +510,33 @@ const registerInputHandlers = (socket: Socket) => {
     socket.on("input:time", (data) => onTimeSelection(authSocket, data));
     socket.on("input:datetime-local", (data) => onDateTimeLocalSelection(authSocket, data));
     socket.on("action", (data) => onGenerateAction(authSocket, data));
+    
+    // Session management events
+    socket.on("session:check", async () => {
+        if (!authSocket.request.user || typeof authSocket.request.user === 'string') {
+            return;
+        }
+        
+        const userId = authSocket.request.user.id;
+        if (!userId) return;
+        
+        try {
+            const id = await getActiveBrowserIdByState(userId, "recording");
+            if (id) {
+                const remainingTime = await browserPool.getRemainingSessionTime(id);
+                if (remainingTime !== null) {
+                    socket.emit('sessionInfo', {
+                        browserId: id,
+                        userId: userId,
+                        remainingTime: Math.floor(remainingTime / 1000), // Convert to seconds
+                        maxSessionTime: 10 * 60 // 10 minutes in seconds
+                    });
+                }
+            }
+        } catch (error: any) {
+            logger.log('error', `Error checking session: ${error.message}`);
+        }
+    });
 };
 
 export default registerInputHandlers;

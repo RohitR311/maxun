@@ -8,7 +8,7 @@ import Run from "../models/Run";
 const router = Router();
 import { getDecryptedProxyConfig } from "../routes/proxy";
 import { uuid } from "uuidv4";
-import { createRemoteBrowserForRun, destroyRemoteBrowser } from "../browser-management/controller";
+import { createRemoteBrowserForRun, destroyRemoteBrowser, getRemoteBrowserRemainingTime } from "../browser-management/controller";
 import logger from "../logger";
 import { browserPool } from "../server";
 import { io, Socket } from "socket.io-client";
@@ -17,7 +17,16 @@ import { AuthenticatedRequest } from "../routes/record"
 import {capture} from "../utils/analytics";
 import { Page } from "playwright";
 import { WorkflowFile } from "maxun-core";
+import { redisClient } from "../storage/connection";
 chromium.use(stealthPlugin());
+
+// Redis keys for API requests
+const REDIS_KEYS = {
+  API_RUN: (runId: string) => `api:run:${runId}`,
+  API_ROBOT_RUNS: (robotId: string) => `api:robot:${robotId}:runs`,
+  API_USER_RUNS: (userId: string) => `api:user:${userId}:runs`,
+  RUN_STATUS: (runId: string) => `run:${runId}:status`,
+};
 
 const formatRecording = (recordingData: any) => {
     const recordingMeta = recordingData.recording_meta;
@@ -293,7 +302,7 @@ router.get("/robots/:id", requireAPIKey, async (req: Request, res: Response) => 
  *                   type: string
  *                   example: "Failed to retrieve runs"
  */
-router.get("/robots/:id/runs",requireAPIKey, async (req: Request, res: Response) => {
+router.get("/robots/:id/runs", requireAPIKey, async (req: Request, res: Response) => {
     try {
         const runs = await Run.findAll({
             where: {
@@ -308,10 +317,18 @@ router.get("/robots/:id/runs",requireAPIKey, async (req: Request, res: Response)
             statusCode: 200,
             messageCode: "success",
             runs: {
-            totalCount: formattedRuns.length,
-            items: formattedRuns,
+                totalCount: formattedRuns.length,
+                items: formattedRuns,
             },
         };
+
+        // Cache runs in Redis for quicker access
+        await redisClient.set(
+            REDIS_KEYS.API_ROBOT_RUNS(req.params.id), 
+            JSON.stringify(formattedRuns),
+            'EX',
+            300 // Cache for 5 minutes
+        );
 
         res.status(200).json(response);
     } catch (error) {
@@ -322,8 +339,7 @@ router.get("/robots/:id/runs",requireAPIKey, async (req: Request, res: Response)
             message: "Failed to retrieve runs",
         });
     }
-}
-);
+});
 
 
 function formatRunResponse(run: any) {
@@ -415,6 +431,18 @@ function formatRunResponse(run: any) {
  */
 router.get("/robots/:id/runs/:runId", requireAPIKey, async (req: Request, res: Response) => {
     try {
+        // Check Redis cache first
+        const cachedRun = await redisClient.get(REDIS_KEYS.API_RUN(req.params.runId));
+        
+        if (cachedRun) {
+            const response = {
+                statusCode: 200,
+                messageCode: "success",
+                run: JSON.parse(cachedRun),
+            };
+            return res.status(200).json(response);
+        }
+        
         const run = await Run.findOne({
             where: {
                 runId: req.params.runId,
@@ -423,10 +451,20 @@ router.get("/robots/:id/runs/:runId", requireAPIKey, async (req: Request, res: R
             raw: true
         });
 
+        const formattedRun = formatRunResponse(run);
+        
+        // Cache the formatted run in Redis
+        await redisClient.set(
+            REDIS_KEYS.API_RUN(req.params.runId), 
+            JSON.stringify(formattedRun),
+            'EX',
+            300 // Cache for 5 minutes
+        );
+
         const response = {
             statusCode: 200,
             messageCode: "success",
-            run: formatRunResponse(run),
+            run: formattedRun,
         };
 
         res.status(200).json(response);
@@ -469,9 +507,24 @@ async function createWorkflowAndStoreMetadata(id: string, userId: string) {
             };
         }
 
-        const browserId = createRemoteBrowserForRun(userId);
-
+        // Get browser ID asynchronously
+        const browserId = await createRemoteBrowserForRun(userId);
         const runId = uuid();
+
+        // Store run info in Redis
+        await redisClient.hmset(REDIS_KEYS.API_RUN(runId), {
+            robotId: id,
+            userId,
+            browserId,
+            status: 'running',
+            startedAt: Date.now().toString(),
+        });
+        
+        // Add to user's API runs set
+        await redisClient.sadd(REDIS_KEYS.API_USER_RUNS(userId), runId);
+        
+        // Add to robot's API runs set
+        await redisClient.sadd(REDIS_KEYS.API_ROBOT_RUNS(id), runId);
 
         const run = await Run.create({
             status: 'running',
@@ -494,7 +547,7 @@ async function createWorkflowAndStoreMetadata(id: string, userId: string) {
         return {
             browserId,
             runId: plainRun.runId,
-        }
+        };
 
     } catch (e) {
         const { message } = e as Error;
@@ -524,6 +577,14 @@ async function readyForRunHandler(browserId: string, id: string, userId: string)
 
     } catch (error: any) {
         logger.error(`Error during readyForRunHandler: ${error.message}`);
+        
+        // Update Redis status on error
+        await redisClient.hmset(REDIS_KEYS.API_RUN(id), {
+            status: 'failed',
+            error: error.message,
+            finishedAt: Date.now().toString()
+        });
+        
         await destroyRemoteBrowser(browserId, userId);
         return null;
     }
@@ -566,11 +627,24 @@ async function executeRun(id: string, userId: string) {
             };
         }
 
+        // Update run status in both database and Redis
         plainRun.status = 'running';
+        await redisClient.hmset(REDIS_KEYS.API_RUN(id), {
+            status: 'running',
+            startedAt: Date.now().toString()
+        });
+        await redisClient.set(REDIS_KEYS.RUN_STATUS(id), 'running');
 
-        const browser = browserPool.getRemoteBrowser(userId);
+        // Get browser asynchronously
+        const browser = await browserPool.getRemoteBrowser(plainRun.browserId);
         if (!browser) {
             throw new Error('Could not access browser');
+        }
+
+        // Check if browser session has enough time remaining
+        const remainingTime = await getRemoteBrowserRemainingTime(plainRun.browserId);
+        if (remainingTime !== null && remainingTime < 60000) { // Less than 1 minute
+            throw new Error('Browser session will expire soon');
         }
 
         let currentPage = await browser.getCurrentPage();
@@ -598,28 +672,35 @@ async function executeRun(id: string, userId: string) {
             binaryOutput: uploadedBinaryOutput,
         });
 
-      let totalRowsExtracted = 0;
-      let extractedScreenshotsCount = 0;
-      let extractedItemsCount = 0;
+        // Update run status in Redis
+        await redisClient.hmset(REDIS_KEYS.API_RUN(id), {
+            status: 'success',
+            finishedAt: Date.now().toString()
+        });
+        await redisClient.set(REDIS_KEYS.RUN_STATUS(id), 'success');
 
-      if (updatedRun.dataValues.binaryOutput && updatedRun.dataValues.binaryOutput["item-0"]) {
-        extractedScreenshotsCount = 1;
-      }
+        let totalRowsExtracted = 0;
+        let extractedScreenshotsCount = 0;
+        let extractedItemsCount = 0;
 
-      if (updatedRun.dataValues.serializableOutput && updatedRun.dataValues.serializableOutput["item-0"]) {
-        const itemsArray = run.dataValues.serializableOutput["item-0"];
-        extractedItemsCount = itemsArray.length;
+        if (updatedRun.dataValues.binaryOutput && updatedRun.dataValues.binaryOutput["item-0"]) {
+            extractedScreenshotsCount = 1;
+        }
 
-        totalRowsExtracted = itemsArray.reduce((total, item) => {
-          return total + Object.keys(item).length;
-        }, 0);
-      }
+        if (updatedRun.dataValues.serializableOutput && updatedRun.dataValues.serializableOutput["item-0"]) {
+            const itemsArray = run.dataValues.serializableOutput["item-0"];
+            extractedItemsCount = itemsArray.length;
 
-      console.log(`Extracted Items Count: ${extractedItemsCount}`);
-      console.log(`Extracted Screenshots Count: ${extractedScreenshotsCount}`);
-      console.log(`Total Rows Extracted: ${totalRowsExtracted}`);
+            totalRowsExtracted = itemsArray.reduce((total, item) => {
+                return total + Object.keys(item).length;
+            }, 0);
+        }
 
-        capture('maxun-oss-run-created-api',{
+        console.log(`Extracted Items Count: ${extractedItemsCount}`);
+        console.log(`Extracted Screenshots Count: ${extractedScreenshotsCount}`);
+        console.log(`Total Rows Extracted: ${totalRowsExtracted}`);
+
+        capture('maxun-oss-run-created-api', {
                 runId: id,
                 created_at: new Date().toISOString(),
                 status: 'success',
@@ -627,7 +708,7 @@ async function executeRun(id: string, userId: string) {
                 totalRowsExtracted,
                 extractedScreenshotsCount,
             }
-        )
+        );
 
         return {
             success: true,
@@ -636,6 +717,8 @@ async function executeRun(id: string, userId: string) {
 
     } catch (error: any) {
         logger.log('info', `Error while running a robot with id: ${id} - ${error.message}`);
+        
+        // Update run status in both database and Redis
         const run = await Run.findOne({ where: { runId: id } });
         if (run) {
             await run.update({
@@ -643,6 +726,14 @@ async function executeRun(id: string, userId: string) {
                 finishedAt: new Date().toLocaleString(),
             });
         }
+        
+        await redisClient.hmset(REDIS_KEYS.API_RUN(id), {
+            status: 'failed',
+            error: error.message,
+            finishedAt: Date.now().toString()
+        });
+        await redisClient.set(REDIS_KEYS.RUN_STATUS(id), 'failed');
+        
         capture(
            'maxun-oss-run-created-api',
            {
@@ -666,6 +757,15 @@ export async function handleRunRecording(id: string, userId: string) {
         if (!browserId || !newRunId || !userId) {
             throw new Error('browserId or runId or userId is undefined');
         }
+
+        // Store the connection info in Redis
+        await redisClient.hmset(REDIS_KEYS.API_RUN(newRunId), {
+            browserId,
+            userId,
+            robotId: id,
+            status: 'initializing',
+            connectionStartedAt: Date.now().toString()
+        });
 
         const socket = io(`${process.env.BACKEND_URL ? process.env.BACKEND_URL : 'http://localhost:8080'}/${browserId}`, {
             transports: ['websocket'],
@@ -694,7 +794,22 @@ function cleanupSocketListeners(socket: Socket, browserId: string, id: string, u
 }
 
 async function waitForRunCompletion(runId: string, interval: number = 2000) {
-    while (true) {
+    const MAX_WAIT_TIME = 5 * 60 * 1000; // 5 minutes
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < MAX_WAIT_TIME) {
+        // Check Redis first for status (faster)
+        const redisStatus = await redisClient.get(REDIS_KEYS.RUN_STATUS(runId));
+        
+        if (redisStatus === 'success') {
+            const run = await Run.findOne({ where: { runId }, raw: true });
+            if (!run) throw new Error('Run not found');
+            return run;
+        } else if (redisStatus === 'failed') {
+            throw new Error('Run failed');
+        }
+        
+        // If Redis doesn't have the status, check the database
         const run = await Run.findOne({ where: { runId }, raw: true });
         if (!run) throw new Error('Run not found');
 
@@ -707,6 +822,8 @@ async function waitForRunCompletion(runId: string, interval: number = 2000) {
         // Wait for the next polling interval
         await new Promise(resolve => setTimeout(resolve, interval));
     }
+    
+    throw new Error('Run timed out after waiting 5 minutes');
 }
 
 /**
@@ -787,12 +904,24 @@ router.post("/robots/:id/runs", requireAPIKey, async (req: AuthenticatedRequest,
         if (!runId) {
             throw new Error('Run ID is undefined');
         }
+        
+        // Use the enhanced wait function with Redis support
         const completedRun = await waitForRunCompletion(runId);
+
+        const formattedRun = formatRunResponse(completedRun);
+        
+        // Cache the result in Redis
+        await redisClient.set(
+            REDIS_KEYS.API_RUN(runId),
+            JSON.stringify(formattedRun),
+            'EX',
+            3600 // Cache for 1 hour
+        );
 
         const response = {
             statusCode: 200,
             messageCode: "success",
-            run: formatRunResponse(completedRun),
+            run: formattedRun,
         };
 
         res.status(200).json(response);
@@ -806,5 +935,107 @@ router.post("/robots/:id/runs", requireAPIKey, async (req: AuthenticatedRequest,
     }
 });
 
-
-export default router;
+// New endpoint to check run status without waiting for completion
+router.get("/robots/:id/runs/:runId/status", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        // Check Redis first for status (faster)
+        const redisStatus = await redisClient.hgetall(REDIS_KEYS.API_RUN(req.params.runId));
+        
+        if (redisStatus && Object.keys(redisStatus).length > 0) {
+            return res.status(200).json({
+                statusCode: 200,
+                messageCode: "success",
+                status: {
+                    runId: req.params.runId,
+                    robotId: req.params.id,
+                    status: redisStatus.status || 'unknown',
+                    startedAt: redisStatus.startedAt ? new Date(parseInt(redisStatus.startedAt)).toLocaleString() : undefined,
+                    finishedAt: redisStatus.finishedAt ? new Date(parseInt(redisStatus.finishedAt)).toLocaleString() : undefined,
+                }
+            });
+        }
+        
+        // If not in Redis, check database
+        const run = await Run.findOne({
+            where: {
+                runId: req.params.runId,
+                robotMetaId: req.params.id
+            },
+            raw: true
+        });
+        
+        if (!run) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Run with id "${req.params.runId}" for robot with id "${req.params.id}" not found.`
+            });
+        }
+        
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            status: {
+                runId: run.runId,
+                robotId: run.robotMetaId,
+                status: run.status,
+                startedAt: run.startedAt,
+                finishedAt: run.finishedAt || undefined
+            }
+        });
+        
+    } catch (error) {
+        console.error("Error checking run status:", error);
+        res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to check run status"
+        });
+    }
+ });
+ 
+ // New endpoint to get active browser information for debugging
+ router.get("/system/browser-status", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        if (!req.user) {
+            return res.status(401).json({ ok: false, error: 'Unauthorized' });
+        }
+        
+        // Get all browser IDs for this user
+        const browserIds = await redisClient.keys(`browser:*:info`);
+        const browsersInfo = [];
+        
+        for (const key of browserIds) {
+            const browserInfo = await redisClient.hgetall(key);
+            if (browserInfo && browserInfo.userId === req.user.dataValues.id) {
+                const browserId = key.split(':')[1];
+                const remainingTime = await getRemoteBrowserRemainingTime(browserId);
+                
+                browsersInfo.push({
+                    browserId,
+                    status: browserInfo.status || 'unknown',
+                    state: browserInfo.state || 'unknown',
+                    active: browserInfo.active === 'true',
+                    startTime: browserInfo.startTime ? new Date(parseInt(browserInfo.startTime)).toLocaleString() : undefined,
+                    remainingTime: remainingTime ? Math.floor(remainingTime / 1000) : null,
+                });
+            }
+        }
+        
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            browsers: browsersInfo
+        });
+        
+    } catch (error) {
+        console.error("Error getting browser status:", error);
+        res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to get browser status"
+        });
+    }
+ });
+ 
+ export default router;

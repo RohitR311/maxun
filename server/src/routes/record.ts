@@ -1,5 +1,6 @@
 /**
  * RESTful API endpoints handling remote browser recording sessions.
+ * Updated to work with Redis-backed BrowserPool and asynchronous operations.
  */
 import { Router, Request, Response } from 'express';
 
@@ -11,6 +12,8 @@ import {
     getRemoteBrowserCurrentTabs,
     getActiveBrowserIdByState,
     destroyRemoteBrowser,
+    getRemoteBrowserRemainingTime,
+    getAllUserBrowserIds,
 } from '../browser-management/controller';
 import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
@@ -41,7 +44,7 @@ router.get('/start', requireSignIn, async (req: AuthenticatedRequest, res: Respo
     }
     
     try {
-        const browserId = initializeRemoteBrowserForRecording(req.user.id);
+        const browserId = await initializeRemoteBrowserForRecording(req.user.id);
         return res.send(browserId);
     } catch (error: any) {
         logger.log('error', `Failed to initialize browser: ${error.message}`);
@@ -53,13 +56,13 @@ router.get('/start', requireSignIn, async (req: AuthenticatedRequest, res: Respo
  * POST endpoint for starting the remote browser recording session accepting browser launch options.
  * returns session's id
  */
-router.post('/start', requireSignIn, (req: AuthenticatedRequest, res:Response) => {
+router.post('/start', requireSignIn, async (req: AuthenticatedRequest, res:Response) => {
     if (!req.user) {
         return res.status(401).send('User not authenticated');
     }
     
     try {
-        const id = initializeRemoteBrowserForRecording(req.user.id);
+        const id = await initializeRemoteBrowserForRecording(req.user.id);
         return res.send(id);
     } catch (error: any) {
         logger.log('error', `Failed to initialize browser: ${error.message}`);
@@ -88,42 +91,93 @@ router.get('/stop/:browserId', requireSignIn, async (req: AuthenticatedRequest, 
 /**
  * GET endpoint for getting the id of the active remote browser.
  */
-router.get('/active', requireSignIn, (req: AuthenticatedRequest, res) => {
+router.get('/active', requireSignIn, async (req: AuthenticatedRequest, res) => {
     if (!req.user) {
         return res.status(401).send('User not authenticated');
     }
-    const id = getActiveBrowserIdByState(req.user?.id, "recording");
-    return res.send(id);
+    try {
+        const id = await getActiveBrowserIdByState(req.user?.id, "recording");
+        return res.send(id);
+    } catch (error: any) {
+        logger.log('error', `Failed to get active browser: ${error.message}`);
+        return res.status(500).send(null);
+    }
 });
 
 /**
  * GET endpoint for getting the current url of the active remote browser.
  */
-router.get('/active/url', requireSignIn, (req: AuthenticatedRequest, res) => {
+router.get('/active/url', requireSignIn, async (req: AuthenticatedRequest, res) => {
     if (!req.user) {
         return res.status(401).send('User not authenticated');
     }
-    const id = getActiveBrowserIdByState(req.user?.id, "recording");
-    if (id) {
-        const url = getRemoteBrowserCurrentUrl(id, req.user?.id);
-        return res.send(url);
+    try {
+        const id = await getActiveBrowserIdByState(req.user?.id, "recording");
+        if (id) {
+            const url = await getRemoteBrowserCurrentUrl(id, req.user?.id);
+            return res.send(url);
+        }
+        return res.send(null);
+    } catch (error: any) {
+        logger.log('error', `Failed to get active browser URL: ${error.message}`);
+        return res.status(500).send(null);
     }
-    return res.send(null);
 });
 
 /**
  * GET endpoint for getting the current tabs of the active remote browser.
  */
-router.get('/active/tabs', requireSignIn, (req: AuthenticatedRequest, res) => {
+router.get('/active/tabs', requireSignIn, async (req: AuthenticatedRequest, res) => {
     if (!req.user) {
         return res.status(401).send('User not authenticated');
     }
-    const id = getActiveBrowserIdByState(req.user?.id, "recording");
-    if (id) {
-        const hosts = getRemoteBrowserCurrentTabs(id, req.user?.id);
-        return res.send(hosts);
+    try {
+        const id = await getActiveBrowserIdByState(req.user?.id, "recording");
+        if (id) {
+            const hosts = await getRemoteBrowserCurrentTabs(id, req.user?.id);
+            return res.send(hosts);
+        }
+        return res.send([]);
+    } catch (error: any) {
+        logger.log('error', `Failed to get active browser tabs: ${error.message}`);
+        return res.status(500).send([]);
     }
-    return res.send([]);
+});
+
+/**
+ * GET endpoint for getting the remaining session time of a browser.
+ */
+router.get('/session/:browserId', requireSignIn, async (req: AuthenticatedRequest, res) => {
+    if (!req.user) {
+        return res.status(401).send('User not authenticated');
+    }
+    try {
+        const remainingTime = await getRemoteBrowserRemainingTime(req.params.browserId);
+        return res.json({
+            browserId: req.params.browserId,
+            remainingTime: remainingTime ? Math.floor(remainingTime / 1000) : null, // Convert to seconds
+            maxSessionTime: 10 * 60, // 10 minutes in seconds
+        });
+    } catch (error: any) {
+        logger.log('error', `Failed to get session info: ${error.message}`);
+        return res.status(500).send({ error: 'Failed to get session information' });
+    }
+});
+
+/**
+ * GET endpoint for getting all browser IDs for a user.
+ */
+router.get('/all-browsers', requireSignIn, async (req: AuthenticatedRequest, res) => {
+    if (!req.user) {
+        return res.status(401).send('User not authenticated');
+    }
+    try {
+        const browserIds = await getAllUserBrowserIds(req.user.id);
+        return res.json({ browserIds });
+    } catch (error: any) {
+        logger.log('error', `Failed to get all user browsers: ${error.message}`);
+        return res.status(500).send({ error: 'Failed to get browser information' });
+    }
 });
 
 /**

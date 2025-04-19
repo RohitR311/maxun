@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import logger from "../logger";
-import { createRemoteBrowserForRun, getActiveBrowserIdByState } from "../browser-management/controller";
+import { createRemoteBrowserForRun, getActiveBrowserIdByState, getAllUserBrowserIds, getRemoteBrowserRemainingTime } from "../browser-management/controller";
 import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { browserPool } from "../server";
@@ -25,10 +25,18 @@ import {
   cancelScheduledWorkflow, 
   scheduleWorkflow 
 } from '../schedule-worker';
+import { redisClient } from '../storage/connection';
 
 chromium.use(stealthPlugin());
 
 export const router = Router();
+
+// Redis keys for run queue management
+const REDIS_KEYS = {
+  RUN_QUEUE: 'runs:queue',
+  RUN_INFO: (runId: string) => `run:${runId}:info`,
+  USER_RUNS: (userId: string) => `user:${userId}:runs`,
+};
 
 export const processWorkflowActions = async (workflow: any[], checkLimit: boolean = false): Promise<any[]> => {
  const processedWorkflow = JSON.parse(JSON.stringify(workflow));
@@ -500,6 +508,10 @@ router.delete('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res)
   }
   try {
     await Run.destroy({ where: { runId: req.params.id } });
+    // Also remove from Redis if it exists
+    await redisClient.srem(REDIS_KEYS.USER_RUNS(req.user.id), req.params.id);
+    await redisClient.del(REDIS_KEYS.RUN_INFO(req.params.id));
+    
     capture(
       'maxun-oss-run-deleted',
       {
@@ -520,7 +532,7 @@ router.delete('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res)
  * PUT endpoint for starting a remote browser instance and saving run metadata to the storage.
  * Making it ready for interpretation and returning a runId.
  * 
- * Modified to work without pgBoss and support checkpoint-based scraping.
+ * Modified to work with Redis-based browser management and support checkpoint-based scraping.
  */
 router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
@@ -558,18 +570,28 @@ router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) =>
     const runId = uuid();
     
     // Check if user has reached browser limit
-    const userBrowserIds = browserPool.getAllBrowserIdsForUser(req.user.id);
+    const userBrowserIds = await getAllUserBrowserIds(req.user.id);
     const canCreateBrowser = userBrowserIds.length < 2;
     
     if (canCreateBrowser) {
       // User has available browser slots, create it directly
-      const id = createRemoteBrowserForRun(req.user.id);
+      const browserId = await createRemoteBrowserForRun(req.user.id);
 
       // Add runId to interpreter settings for checkpoint-based scraping
       const interpreterSettings = {
         ...req.body,
         runId // Set runId for checkpoint management
       };
+
+      // Store run information in both Redis and database
+      await redisClient.sadd(REDIS_KEYS.USER_RUNS(req.user.id), runId);
+      await redisClient.hmset(REDIS_KEYS.RUN_INFO(runId), {
+        status: 'running',
+        userId: req.user.id,
+        browserId,
+        robotMetaId: recording.recording_meta.id,
+        startedAt: Date.now().toString(),
+      });
 
       const run = await Run.create({
         status: 'running',
@@ -578,7 +600,7 @@ router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) =>
         robotMetaId: recording.recording_meta.id,
         startedAt: new Date().toLocaleString(),
         finishedAt: '',
-        browserId: id,
+        browserId,
         interpreterSettings,
         log: '',
         runId,
@@ -590,50 +612,55 @@ router.put('/runs/:id', requireSignIn, async (req: AuthenticatedRequest, res) =>
       const plainRun = run.toJSON();
 
       return res.send({
-        browserId: id,
+        browserId,
         runId: plainRun.runId,
         robotMetaId: recording.recording_meta.id,
         queued: false
       });
     } else {
-      const browserId = getActiveBrowserIdByState(req.user.id, "run")
+      // User has reached the browser limit, need to queue the run
+      try {
+        const activeBrowserId = await getActiveBrowserIdByState(req.user.id, "run");
 
-      if (browserId) {
-        // User has reached the browser limit, queue the run
-        try {        
-          // Create the run record with 'queued' status
-          await Run.create({
-            status: 'queued',
-            name: recording.recording_meta.name,
-            robotId: recording.id,
-            robotMetaId: recording.recording_meta.id,
-            startedAt: new Date().toLocaleString(),
-            finishedAt: '',
-            browserId: browserId,
-            interpreterSettings: {
-              ...req.body,
-              runId // Set runId for checkpoint management
-            },
-            log: 'Run queued - waiting for available browser slot',
-            runId,
-            runByUserId: req.user.id,
-            serializableOutput: {},
-            binaryOutput: {},
-          });
-          
-          return res.send({
-            browserId: browserId,
-            runId: runId,
-            robotMetaId: recording.recording_meta.id,
-            queued: true,
-          });
-        } catch (queueError: any) {
-          logger.log('error', `Failed to queue run job: ${queueError.message}`);
-          return res.status(503).send({ error: 'Unable to queue run, please try again later' });
-        }
-      } else {
-        logger.log('info', "Browser id does not exist");
-        return res.send('');
+        // Store in Redis queue
+        await redisClient.sadd(REDIS_KEYS.USER_RUNS(req.user.id), runId);
+        await redisClient.hmset(REDIS_KEYS.RUN_INFO(runId), {
+          status: 'queued',
+          userId: req.user.id,
+          robotMetaId: recording.recording_meta.id,
+          startedAt: Date.now().toString(),
+        });
+        await redisClient.lpush(REDIS_KEYS.RUN_QUEUE, runId);
+        
+        // Create the run record with 'queued' status
+        await Run.create({
+          status: 'queued',
+          name: recording.recording_meta.name,
+          robotId: recording.id,
+          robotMetaId: recording.recording_meta.id,
+          startedAt: new Date().toLocaleString(),
+          finishedAt: '',
+          browserId: activeBrowserId || 'pending',
+          interpreterSettings: {
+            ...req.body,
+            runId // Set runId for checkpoint management
+          },
+          log: 'Run queued - waiting for available browser slot',
+          runId,
+          runByUserId: req.user.id,
+          serializableOutput: {},
+          binaryOutput: {},
+        });
+        
+        return res.send({
+          browserId: activeBrowserId || 'pending',
+          runId,
+          robotMetaId: recording.recording_meta.id,
+          queued: true,
+        });
+      } catch (queueError: any) {
+        logger.log('error', `Failed to queue run job: ${queueError.message}`);
+        return res.status(503).send({ error: 'Unable to queue run, please try again later' });
       }
     }
   } catch (e) {
@@ -673,6 +700,7 @@ function AddGeneratedFlags(workflow: WorkflowFile) {
 
 /**
  * POST endpoint for executing a run - modified to use direct execution instead of pgBoss
+ * and handle session time limits
  */
 router.post('/runs/run/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
@@ -690,6 +718,22 @@ router.post('/runs/run/:id', requireSignIn, async (req: AuthenticatedRequest, re
     const recording = await Robot.findOne({ where: { 'recording_meta.id': plainRun.robotMetaId }, raw: true });
     if (!recording) {
       return res.status(404).send(false);
+    }
+
+    // Check if the browser has enough session time remaining
+    if (plainRun.browserId) {
+      const remainingTime = await getRemoteBrowserRemainingTime(plainRun.browserId);
+      
+      // If less than 1 minute remaining, don't allow the run to start
+      if (remainingTime !== null && remainingTime < 60000) {
+        await run.update({
+          status: 'failed',
+          finishedAt: new Date().toLocaleString(),
+          log: `Run failed: Browser session will expire soon. Please create a new run.`
+        });
+        
+        return res.status(400).send({ error: 'Browser session will expire soon. Please create a new run.' });
+      }
     }
 
     try {
@@ -748,47 +792,47 @@ router.post('/runs/run/:id', requireSignIn, async (req: AuthenticatedRequest, re
     );
     return res.send(false);
   }
-});
-
-router.put('/schedule/:id/', requireSignIn, async (req: AuthenticatedRequest, res) => {
+ });
+ 
+ router.put('/schedule/:id/', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
     const { runEvery, runEveryUnit, startFrom, dayOfMonth, atTimeStart, atTimeEnd, timezone } = req.body;
-
+ 
     const robot = await Robot.findOne({ where: { 'recording_meta.id': id } });
     if (!robot) {
       return res.status(404).json({ error: 'Robot not found' });
     }
-
+ 
     // Validate required parameters
     if (!runEvery || !runEveryUnit || !startFrom || !atTimeStart || !atTimeEnd || !timezone) {
       return res.status(400).json({ error: 'Missing required parameters' });
     }
-
+ 
     // Validate time zone
     if (!moment.tz.zone(timezone)) {
       return res.status(400).json({ error: 'Invalid timezone' });
     }
-
+ 
     // Validate and parse start and end times
     const [startHours, startMinutes] = atTimeStart.split(':').map(Number);
     const [endHours, endMinutes] = atTimeEnd.split(':').map(Number);
-
+ 
     if (isNaN(startHours) || isNaN(startMinutes) || isNaN(endHours) || isNaN(endMinutes) ||
       startHours < 0 || startHours > 23 || startMinutes < 0 || startMinutes > 59 ||
       endHours < 0 || endHours > 23 || endMinutes < 0 || endMinutes > 59) {
       return res.status(400).json({ error: 'Invalid time format' });
     }
-
+ 
     const days = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
     if (!days.includes(startFrom)) {
       return res.status(400).json({ error: 'Invalid start day' });
     }
-
+ 
     // Build cron expression based on run frequency and starting day
     let cronExpression;
     const dayIndex = days.indexOf(startFrom);
-
+ 
     switch (runEveryUnit) {
       case 'MINUTES':
         cronExpression = `*/${runEvery} * * * *`;
@@ -812,26 +856,26 @@ router.put('/schedule/:id/', requireSignIn, async (req: AuthenticatedRequest, re
       default:
         return res.status(400).json({ error: 'Invalid runEveryUnit' });
     }
-
+ 
     // Validate cron expression
     if (!cronExpression || !cron.validate(cronExpression)) {
       return res.status(400).json({ error: 'Invalid cron expression generated' });
     }
-
+ 
     if (!req.user) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-
+ 
     try {
       await cancelScheduledWorkflow(id);
     } catch (cancelError) {
       logger.log('warn', `Failed to cancel existing schedule for robot ${id}: ${cancelError}`);
     }
-
+ 
     const jobId = await scheduleWorkflow(id, req.user.id, cronExpression, timezone);
-
+ 
     const nextRunAt = computeNextRun(cronExpression, timezone);
-
+ 
     await robot.update({
       schedule: {
         runEvery,
@@ -846,7 +890,7 @@ router.put('/schedule/:id/', requireSignIn, async (req: AuthenticatedRequest, re
         nextRunAt: nextRunAt || undefined,
       },
     });
-
+ 
     capture(
       'maxun-oss-robot-scheduled',
       {
@@ -855,10 +899,10 @@ router.put('/schedule/:id/', requireSignIn, async (req: AuthenticatedRequest, re
         scheduled_at: new Date().toISOString(),
       }
     )
-
+ 
     // Fetch updated schedule details after setting it
     const updatedRobot = await Robot.findOne({ where: { 'recording_meta.id': id } });
-
+ 
     res.status(200).json({
       message: 'success',
       robot: updatedRobot,
@@ -867,42 +911,42 @@ router.put('/schedule/:id/', requireSignIn, async (req: AuthenticatedRequest, re
     console.error('Error scheduling workflow:', error);
     res.status(500).json({ error: 'Failed to schedule workflow' });
   }
-});
-
-
-// Endpoint to get schedule details
-router.get('/schedule/:id', requireSignIn, async (req, res) => {
+ });
+ 
+ 
+ // Endpoint to get schedule details
+ router.get('/schedule/:id', requireSignIn, async (req, res) => {
   try {
     const robot = await Robot.findOne({ where: { 'recording_meta.id': req.params.id }, raw: true });
-
+ 
     if (!robot) {
       return res.status(404).json({ error: 'Robot not found' });
     }
-
+ 
     return res.status(200).json({
       schedule: robot.schedule
     });
-
+ 
   } catch (error) {
     console.error('Error getting schedule:', error);
     res.status(500).json({ error: 'Failed to get schedule' });
   }
-});
-
-// Endpoint to delete schedule
-router.delete('/schedule/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
+ });
+ 
+ // Endpoint to delete schedule
+ router.delete('/schedule/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
     const { id } = req.params;
-
+ 
     if (!req.user) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-
+ 
     const robot = await Robot.findOne({ where: { 'recording_meta.id': id } });
     if (!robot) {
       return res.status(404).json({ error: 'Robot not found' });
     }
-
+ 
     // Cancel the scheduled job in the scheduler
     try {
       await cancelScheduledWorkflow(id);
@@ -910,12 +954,12 @@ router.delete('/schedule/:id', requireSignIn, async (req: AuthenticatedRequest, 
       logger.log('error', `Error cancelling scheduled job for robot ${id}: ${error}`);
       // Continue with robot update even if cancellation fails
     }
-
+ 
     // Delete the schedule from the robot
     await robot.update({
       schedule: null
     });
-
+ 
     capture(
       'maxun-oss-robot-schedule-deleted',
       {
@@ -924,19 +968,19 @@ router.delete('/schedule/:id', requireSignIn, async (req: AuthenticatedRequest, 
         unscheduled_at: new Date().toISOString(),
       }
     )
-
+ 
     res.status(200).json({ message: 'Schedule deleted successfully' });
-
+ 
   } catch (error) {
     console.error('Error deleting schedule:', error);
     res.status(500).json({ error: 'Failed to delete schedule' });
   }
-});
-
-/**
+ });
+ 
+ /**
  * POST endpoint for aborting a current interpretation of the run.
  */
-router.post('/runs/abort/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
+ router.post('/runs/abort/:id', requireSignIn, async (req: AuthenticatedRequest, res) => {
   try {
     if (!req.user) { 
       return res.status(401).send({ error: 'Unauthorized' }); 
@@ -954,8 +998,8 @@ router.post('/runs/abort/:id', requireSignIn, async (req: AuthenticatedRequest, 
     }
     
     const plainRun = run.toJSON();
-
-    const browser = browserPool.getRemoteBrowser(plainRun.browserId);
+ 
+    const browser = await browserPool.getRemoteBrowser(plainRun.browserId);
     if (!browser) {
       return res.status(404).send({ error: 'Browser not found' });
     }
@@ -994,4 +1038,29 @@ router.post('/runs/abort/:id', requireSignIn, async (req: AuthenticatedRequest, 
     logger.log('error', `Error while aborting run ${req.params.id}: ${message}`);
     return res.send(false);
   }
-});
+ });
+ 
+ // Helper endpoint for checking browser session status
+ router.get('/browser-session/:browserId', requireSignIn, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).send({ error: 'Unauthorized' });
+    }
+    
+    const remainingTime = await getRemoteBrowserRemainingTime(req.params.browserId);
+    if (remainingTime === null) {
+      return res.status(404).json({ error: 'Browser not found or session expired' });
+    }
+    
+    return res.json({
+      browserId: req.params.browserId,
+      remainingTime: Math.floor(remainingTime / 1000), // Convert to seconds
+      maxSessionTime: 10 * 60, // 10 minutes in seconds
+    });
+  } catch (error) {
+    logger.log('error', `Error getting browser session info: ${error}`);
+    return res.status(500).json({ error: 'Failed to get browser session information' });
+  }
+ });
+ 
+ export default router;

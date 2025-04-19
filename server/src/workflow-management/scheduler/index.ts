@@ -13,7 +13,16 @@ import { BinaryOutputService } from "../../storage/mino";
 import { capture } from "../../utils/analytics";
 import { WorkflowFile } from "maxun-core";
 import { Page } from "playwright";
+import { redisClient } from "../../storage/connection";
 chromium.use(stealthPlugin());
+
+// Redis keys for scheduling
+const REDIS_KEYS = {
+  SCHEDULED_RUNS: 'scheduled:runs',
+  RUN_SCHEDULE: (runId: string) => `run:${runId}:schedule`,
+  ROBOT_SCHEDULE: (robotId: string) => `robot:${robotId}:schedule`,
+  USER_SCHEDULED_RUNS: (userId: string) => `user:${userId}:scheduled:runs`,
+};
 
 async function createWorkflowAndStoreMetadata(id: string, userId: string) {
   try {
@@ -44,8 +53,20 @@ async function createWorkflowAndStoreMetadata(id: string, userId: string) {
       };
     }
 
-    const browserId = createRemoteBrowserForRun( userId);
+    // Create a browser asynchronously
+    const browserId = await createRemoteBrowserForRun(userId);
     const runId = uuid();
+
+    // Store schedule information in Redis
+    await redisClient.sadd(REDIS_KEYS.SCHEDULED_RUNS, runId);
+    await redisClient.sadd(REDIS_KEYS.USER_SCHEDULED_RUNS(userId), runId);
+    await redisClient.hmset(REDIS_KEYS.RUN_SCHEDULE(runId), {
+      robotId: id,
+      userId,
+      browserId,
+      createdAt: Date.now().toString(),
+      status: 'scheduled'
+    });
 
     const run = await Run.create({
       status: 'scheduled',
@@ -112,9 +133,17 @@ async function executeRun(id: string, userId: string) {
       }
     }
 
+    // Update run status in Redis and database
+    await redisClient.hmset(REDIS_KEYS.RUN_SCHEDULE(id), {
+      status: 'running',
+      startedAt: Date.now().toString()
+    });
+    
     plainRun.status = 'running';
+    await run.update({ status: 'running' });
 
-    const browser = browserPool.getRemoteBrowser(plainRun.browserId);
+    // Get browser asynchronously
+    const browser = await browserPool.getRemoteBrowser(plainRun.browserId);
     if (!browser) {
       throw new Error('Could not access browser');
     }
@@ -134,6 +163,7 @@ async function executeRun(id: string, userId: string) {
 
     await destroyRemoteBrowser(plainRun.browserId, userId);
 
+    // Update run in database
     await run.update({
       ...run,
       status: 'success',
@@ -142,6 +172,12 @@ async function executeRun(id: string, userId: string) {
       log: interpretationInfo.log.join('\n'),
       serializableOutput: interpretationInfo.serializableOutput,
       binaryOutput: uploadedBinaryOutput,
+    });
+
+    // Update Redis status
+    await redisClient.hmset(REDIS_KEYS.RUN_SCHEDULE(id), {
+      status: 'success',
+      finishedAt: Date.now().toString()
     });
 
     let totalRowsExtracted = 0;
@@ -188,6 +224,8 @@ async function executeRun(id: string, userId: string) {
   } catch (error: any) {
     logger.log('info', `Error while running a robot with id: ${id} - ${error.message}`);
     console.log(error.message);
+    
+    // Update run status to failed in database
     const run = await Run.findOne({ where: { runId: id } });
     if (run) {
       await run.update({
@@ -195,6 +233,14 @@ async function executeRun(id: string, userId: string) {
         finishedAt: new Date().toLocaleString(),
       });
     }
+    
+    // Update Redis status
+    await redisClient.hmset(REDIS_KEYS.RUN_SCHEDULE(id), {
+      status: 'failed',
+      error: error.message,
+      finishedAt: Date.now().toString()
+    });
+    
     capture(
       'maxun-oss-run-created-scheduled',
       {
@@ -222,6 +268,14 @@ async function readyForRunHandler(browserId: string, id: string, userId: string)
 
   } catch (error: any) {
     logger.error(`Error during readyForRunHandler: ${error.message}`);
+    
+    // Update Redis status on error
+    await redisClient.hmset(REDIS_KEYS.RUN_SCHEDULE(id), {
+      status: 'failed',
+      error: error.message,
+      finishedAt: Date.now().toString()
+    });
+    
     await destroyRemoteBrowser(browserId, userId);
   }
 }
@@ -240,6 +294,15 @@ export async function handleRunRecording(id: string, userId: string) {
       throw new Error('browserId or runId or userId is undefined');
     }
 
+    // Store the workflow execution mapping in Redis
+    await redisClient.hmset(REDIS_KEYS.ROBOT_SCHEDULE(id), {
+      runId: newRunId,
+      userId,
+      browserId,
+      status: 'initializing',
+      startedAt: Date.now().toString()
+    });
+
     const socket = io(`${process.env.BACKEND_URL ? process.env.BACKEND_URL : 'http://localhost:8080'}/${browserId}`, {
       transports: ['websocket'],
       rejectUnauthorized: false
@@ -255,12 +318,88 @@ export async function handleRunRecording(id: string, userId: string) {
 
   } catch (error: any) {
     logger.error('Error running recording:', error);
+    
+    // Clean up any Redis entries on error
+    try {
+      if (error.runId) {
+        await redisClient.hmset(REDIS_KEYS.RUN_SCHEDULE(error.runId), {
+          status: 'failed',
+          error: error.message,
+          finishedAt: Date.now().toString()
+        });
+      }
+    } catch (redisError) {
+      logger.error('Error updating Redis during error handling:', redisError);
+    }
   }
 }
 
 function cleanupSocketListeners(socket: Socket, browserId: string, id: string, userId: string) {
   socket.off('ready-for-run', () => readyForRunHandler(browserId, id, userId));
   logger.log('info', `Cleaned up listeners for browserId: ${browserId}, runId: ${id}`);
+}
+
+/**
+ * Schedule a workflow to run at specified intervals
+ */
+export async function scheduleWorkflow(robotId: string, userId: string, cronExpression: string, timezone: string): Promise<string> {
+  try {
+    const scheduleId = uuid();
+    
+    // Store schedule info in Redis
+    await redisClient.hmset(REDIS_KEYS.ROBOT_SCHEDULE(robotId), {
+      scheduleId,
+      userId,
+      cronExpression,
+      timezone,
+      status: 'active',
+      createdAt: Date.now().toString()
+    });
+    
+    logger.log('info', `Scheduled workflow ${robotId} with schedule ID ${scheduleId}`);
+    
+    return scheduleId;
+  } catch (error) {
+    logger.error(`Failed to schedule workflow: ${error}`);
+    throw error;
+  }
+}
+
+/**
+ * Cancel a scheduled workflow
+ */
+export async function cancelScheduledWorkflow(robotId: string): Promise<boolean> {
+  try {
+    const scheduleExists = await redisClient.exists(REDIS_KEYS.ROBOT_SCHEDULE(robotId));
+    
+    if (scheduleExists) {
+      await redisClient.hmset(REDIS_KEYS.ROBOT_SCHEDULE(robotId), {
+        status: 'canceled',
+        canceledAt: Date.now().toString()
+      });
+      
+      logger.log('info', `Canceled scheduled workflow for robot ${robotId}`);
+      return true;
+    } else {
+      logger.log('warn', `No schedule found for robot ${robotId}`);
+      return false;
+    }
+  } catch (error) {
+    logger.error(`Failed to cancel scheduled workflow: ${error}`);
+    return false;
+  }
+}
+
+/**
+ * Get all scheduled runs for a user
+ */
+export async function getScheduledRunsForUser(userId: string): Promise<string[]> {
+  try {
+    return await redisClient.smembers(REDIS_KEYS.USER_SCHEDULED_RUNS(userId));
+  } catch (error) {
+    logger.error(`Failed to get scheduled runs for user ${userId}: ${error}`);
+    return [];
+  }
 }
 
 export { createWorkflowAndStoreMetadata };
