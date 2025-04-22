@@ -27,6 +27,7 @@ minioClient.bucketExists('maxun-test')
 const SCREENSHOTS_BUCKET = 'maxun-run-screenshots';
 const CHECKPOINT_BUCKET = 'maxun-scraping-checkpoints';
 const SCRAPING_RESULTS_BUCKET = 'maxun-scraping-results';
+const RUN_CHECKPOINT_BUCKET = 'maxun-run-checkpoints';
 
 /**
  * Creates a bucket with the specified policy if it doesn't exist
@@ -196,11 +197,12 @@ class BinaryOutputService {
 }
 
 /**
- * Service class for handling scraping checkpoints and results with 30-second interval support
+ * Service class for handling scraping checkpoints and results
+ * Enhanced to support browser session-based execution
  */
 class ScrapingStateService {
   /**
-   * Stores a scraping checkpoint for 30-second interval execution
+   * Stores a scraping checkpoint
    * @param runId - Unique identifier for the run
    * @param scrapingId - Unique identifier for the specific scraping action
    * @param checkpoint - The checkpoint state to store
@@ -302,7 +304,7 @@ class ScrapingStateService {
   }
 
   /**
-   * Stores the results from a 30-second scraping interval
+   * Stores the results from a scraping session
    * @param runId - Unique identifier for the run
    * @param scrapingId - Unique identifier for the specific scraping action
    * @param data - The scraping results to store
@@ -357,7 +359,7 @@ class ScrapingStateService {
   }
 
   /**
-   * Merges all scraping results from 30-second intervals for a specific scraping action
+   * Merges all scraping results from multiple browser sessions for a specific scraping action
    * @param runId - Unique identifier for the run
    * @param scrapingId - Unique identifier for the specific scraping action
    * @returns Promise resolving to the merged results
@@ -431,6 +433,251 @@ class ScrapingStateService {
       throw error;
     }
   }
+
+  /**
+   * Lists all scraping IDs for a run
+   * @param runId - Unique identifier for the run
+   * @returns Promise resolving to an array of scraping IDs
+   */
+  async getAllScrapingIds(runId: string): Promise<string[]> {
+    try {
+      const prefix = `${runId}/`;
+      const stream = minioClient.listObjects(CHECKPOINT_BUCKET, prefix, true);
+      
+      const ids = new Set<string>();
+      for await (const obj of stream) {
+        if (obj.name) {
+          // Extract scraping ID from the key pattern: runId/scrapingId-checkpoint-timestamp.json
+          const parts = obj.name.substring(prefix.length).split('-checkpoint-');
+          if (parts.length >= 1) {
+            ids.add(parts[0]);
+          }
+        }
+      }
+      
+      return Array.from(ids);
+    } catch (error) {
+      console.error(`Error listing scraping IDs for run ${runId}:`, error);
+      return [];
+    }
+  }
+  
+  /**
+   * Get all scraping checkpoints for a run
+   * @param runId - Unique identifier for the run
+   * @returns Promise resolving to a record mapping scraping IDs to their checkpoints
+   */
+  async getAllScrapingCheckpoints(runId: string): Promise<Record<string, any>> {
+    try {
+      const scrapingIds = await this.getAllScrapingIds(runId);
+      const checkpoints: Record<string, any> = {};
+      
+      for (const scrapingId of scrapingIds) {
+        const checkpoint = await this.getLatestScrapingCheckpoint(runId, scrapingId);
+        if (checkpoint) {
+          checkpoints[scrapingId] = checkpoint;
+        }
+      }
+      
+      return checkpoints;
+    } catch (error) {
+      console.error(`Failed to get all checkpoints for run ${runId}: ${error}`);
+      return {};
+    }
+  }
+  
+  /**
+   * Deletes a specific scraping checkpoint 
+   * @param runId - Unique identifier for the run
+   * @param scrapingId - Unique identifier for the specific scraping action
+   */
+  async deleteScrapingCheckpoint(runId: string, scrapingId: string): Promise<void> {
+    try {
+      const keys = await this.listScrapingCheckpoints(runId, scrapingId);
+      
+      for (const key of keys) {
+        await minioClient.removeObject(CHECKPOINT_BUCKET, key);
+      }
+      
+      console.log(`Successfully deleted checkpoints for run ${runId}, scraping ${scrapingId}`);
+    } catch (error) {
+      console.error(`Error deleting checkpoints for run ${runId}, scraping ${scrapingId}:`, error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Lists all checkpoint files for a specific scraping action
+   * @param runId - Unique identifier for the run
+   * @param scrapingId - Unique identifier for the specific scraping action
+   * @returns Promise resolving to an array of checkpoint keys
+   */
+  async listScrapingCheckpoints(runId: string, scrapingId: string): Promise<string[]> {
+    try {
+      const prefix = `${runId}/${scrapingId}-checkpoint-`;
+      const stream = minioClient.listObjects(CHECKPOINT_BUCKET, prefix, true);
+      
+      const keys: string[] = [];
+      for await (const obj of stream) {
+        if (obj.name) {
+          keys.push(obj.name);
+        }
+      }
+      
+      return keys;
+    } catch (error) {
+      console.error(`Error listing checkpoints for run ${runId}, scraping ${scrapingId}:`, error);
+      return [];
+    }
+  }
+  
+  /**
+   * Deletes all data for a specific scraping operation (checkpoints and results)
+   * @param runId - Unique identifier for the run
+   * @param scrapingId - Unique identifier for the specific scraping action
+   */
+  async deleteScrapingData(runId: string, scrapingId: string): Promise<void> {
+    try {
+      // Delete checkpoints
+      await this.deleteScrapingCheckpoint(runId, scrapingId);
+      
+      // Delete results
+      const resultKeys = await this.listScrapingResults(runId, scrapingId);
+      for (const key of resultKeys) {
+        await minioClient.removeObject(SCRAPING_RESULTS_BUCKET, key);
+      }
+      
+      console.log(`Successfully deleted all data for run ${runId}, scraping ${scrapingId}`);
+    } catch (error) {
+      console.error(`Error deleting data for run ${runId}, scraping ${scrapingId}:`, error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Deletes all scraping data for a run
+   * @param runId - Unique identifier for the run
+   */
+  async deleteAllScrapingCheckpoints(runId: string): Promise<void> {
+    try {
+      const scrapingIds = await this.getAllScrapingIds(runId);
+      
+      for (const scrapingId of scrapingIds) {
+        await this.deleteScrapingData(runId, scrapingId);
+      }
+      
+      console.log(`Successfully deleted all scraping data for run ${runId}`);
+    } catch (error) {
+      console.error(`Error deleting all scraping data for run ${runId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+ * Merges schema scraping results from multiple browser sessions
+ * @param runId - Unique identifier for the run
+ * @param scrapingId - Unique identifier for the specific schema scraping action
+ * @returns Promise resolving to the merged schema results
+ */
+async mergeSchemaScrapingResults(runId: string, scrapingId: string): Promise<Record<string, any>> {
+  try {
+    const keys = await this.listScrapingResults(runId, scrapingId);
+    
+    if (keys.length === 0) {
+      return {};
+    }
+    
+    // Create a merged result object
+    const mergedResults: Record<string, any> = {};
+    
+    // Process each batch and merge properties
+    for (const key of keys) {
+      const batchResults = await this.getIntermediateResults<any[]>(key);
+      
+      if (Array.isArray(batchResults) && batchResults.length > 0) {
+        // If the batch has results, merge them into the final object
+        for (const result of batchResults) {
+          if (typeof result === 'object' && result !== null) {
+            // Merge each property
+            Object.entries(result).forEach(([propKey, propValue]) => {
+              // Only update if the property doesn't exist or is empty
+              if (!(propKey in mergedResults) || 
+                  mergedResults[propKey] === undefined || 
+                  mergedResults[propKey] === null || 
+                  mergedResults[propKey] === '') {
+                mergedResults[propKey] = propValue;
+              }
+            });
+          }
+        }
+      }
+    }
+    
+    return mergedResults;
+  } catch (error) {
+    console.error(`Error merging schema results for run ${runId}, scraping ${scrapingId}:`, error);
+    return {};
+  }
+}
+
+/**
+ * Determines if a schema scraping operation is complete
+ * Checks if all expected fields in the schema have values
+ * 
+ * @param runId - Unique identifier for the run
+ * @param scrapingId - Unique identifier for the specific schema scraping action
+ * @param expectedFields - Array of field names expected in the completed schema
+ * @returns Promise resolving to whether the schema is complete
+ */
+async isSchemaScrapingComplete(
+  runId: string, 
+  scrapingId: string, 
+  expectedFields: string[]
+): Promise<boolean> {
+  try {
+    const mergedResults = await this.mergeSchemaScrapingResults(runId, scrapingId);
+    
+    // Check if all expected fields exist and have values
+    return expectedFields.every(field => 
+      field in mergedResults && 
+      mergedResults[field] !== undefined && 
+      mergedResults[field] !== null && 
+      mergedResults[field] !== ''
+    );
+  } catch (error) {
+    console.error(`Error checking schema completion for run ${runId}, scraping ${scrapingId}:`, error);
+    return false;
+  }
+}
+
+/**
+ * Gets the missing fields from a schema scraping operation
+ * 
+ * @param runId - Unique identifier for the run
+ * @param scrapingId - Unique identifier for the specific schema scraping action
+ * @param expectedFields - Array of field names expected in the completed schema
+ * @returns Promise resolving to array of missing field names
+ */
+async getMissingSchemaFields(
+  runId: string, 
+  scrapingId: string, 
+  expectedFields: string[]
+): Promise<string[]> {
+  try {
+    const mergedResults = await this.mergeSchemaScrapingResults(runId, scrapingId);
+    
+    // Return fields that are missing or have empty values
+    return expectedFields.filter(field => 
+      !(field in mergedResults) || 
+      mergedResults[field] === undefined || 
+      mergedResults[field] === null || 
+      mergedResults[field] === ''
+    );
+  } catch (error) {
+    console.error(`Error getting missing schema fields for run ${runId}, scraping ${scrapingId}:`, error);
+    return expectedFields; // Return all fields as missing if there's an error
+  }
+}
 }
 
 export { 
@@ -439,5 +686,5 @@ export {
   ScrapingStateService, 
   SCREENSHOTS_BUCKET, 
   CHECKPOINT_BUCKET, 
-  SCRAPING_RESULTS_BUCKET 
+  SCRAPING_RESULTS_BUCKET,
 };

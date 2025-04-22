@@ -16,11 +16,7 @@ import { computeNextRun } from '../utils/schedule';
 import { capture } from "../utils/analytics";
 import { encrypt, decrypt } from '../utils/auth';
 import { WorkflowFile } from 'maxun-core';
-import { 
-  processRunExecution, 
-  interpretWorkflowForRun, 
-  stopWorkflowInterpretation 
-} from '../pgboss-worker';
+import { processRunExecution } from '../pgboss-worker';
 import { 
   cancelScheduledWorkflow, 
   scheduleWorkflow 
@@ -718,22 +714,6 @@ router.post('/runs/run/:id', requireSignIn, async (req: AuthenticatedRequest, re
     const recording = await Robot.findOne({ where: { 'recording_meta.id': plainRun.robotMetaId }, raw: true });
     if (!recording) {
       return res.status(404).send(false);
-    }
-
-    // Check if the browser has enough session time remaining
-    if (plainRun.browserId) {
-      const remainingTime = await getRemoteBrowserRemainingTime(plainRun.browserId);
-      
-      // If less than 1 minute remaining, don't allow the run to start
-      if (remainingTime !== null && remainingTime < 60000) {
-        await run.update({
-          status: 'failed',
-          finishedAt: new Date().toLocaleString(),
-          log: `Run failed: Browser session will expire soon. Please create a new run.`
-        });
-        
-        return res.status(400).send({ error: 'Browser session will expire soon. Please create a new run.' });
-      }
     }
 
     try {

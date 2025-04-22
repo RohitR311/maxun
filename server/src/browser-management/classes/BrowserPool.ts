@@ -82,12 +82,12 @@ export class BrowserPool {
     /**
      * The maximum duration of a recording session in milliseconds (10 minutes)
      */
-    private readonly MAX_SESSION_DURATION = 1.5 * 60 * 1000;
+    private readonly MAX_SESSION_DURATION = 1 * 60 * 1000;
     
     /**
      * The warning time before session ends in milliseconds (1 minute)
      */
-    private readonly WARNING_TIME = 1 * 60 * 1000;
+    private readonly WARNING_TIME = 0.5 * 60 * 1000;
 
     /**
      * Interval timers for session management
@@ -227,6 +227,7 @@ export class BrowserPool {
             
             // Get existing browsers for this user from Redis
             const userBrowserIds = await redisClient.smembers(REDIS_KEYS.USER_BROWSERS(userId));
+            console.log("User browser IDs: ", userBrowserIds);
             
             // If trying to add a "recording" browser, check if one already exists
             if (state === "recording") {
@@ -351,7 +352,7 @@ export class BrowserPool {
      * @param id remote browser instance's id
      * @returns true if the browser was removed successfully, false otherwise
      */
-    public deleteRemoteBrowser = async (id: string): Promise<boolean> => {
+    public deleteRemoteBrowser = async (id: string, userId: string): Promise<boolean> => {
         try {
             // Check if browser exists in Redis
             const exists = await redisClient.exists(REDIS_KEYS.BROWSER_INFO(id));
@@ -361,7 +362,7 @@ export class BrowserPool {
             }
             
             // Get user ID from Redis
-            const userId = await redisClient.hget(REDIS_KEYS.BROWSER_INFO(id), 'userId');
+            // const userId = await redisClient.hget(REDIS_KEYS.BROWSER_INFO(id), 'userId');
             
             // Stop session timer if it exists
             if (this.sessionTimers.has(id)) {

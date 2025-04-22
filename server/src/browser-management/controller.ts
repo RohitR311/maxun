@@ -6,7 +6,7 @@
 import { Socket } from "socket.io";
 import { uuid } from 'uuidv4';
 
-import { createSocketConnection, createSocketConnectionForRun } from "../socket-connection/connection";
+import { createSocketConnection, createSocketConnectionForRun, registerBrowserUserContext } from "../socket-connection/connection";
 import { io, browserPool } from "../server";
 import { RemoteBrowser } from "./classes/RemoteBrowser";
 import { RemoteBrowserOptions } from "../types";
@@ -108,6 +108,9 @@ async function createNewRecordingBrowser(id: string, socket: Socket, userId: str
  */
 export const createRemoteBrowserForRun = async (userId: string): Promise<string> => {
   const id = uuid();
+
+  registerBrowserUserContext(id, userId);
+  logger.log('debug', `Created new browser for run: ${id} for user: ${userId}`);
   
   createSocketConnectionForRun(
     io.of(id), 
@@ -140,6 +143,8 @@ export const createRemoteBrowserForRun = async (userId: string): Promise<string>
 export const destroyRemoteBrowser = async (id: string, userId: string): Promise<boolean> => {
   try {
     const browserSession = await browserPool.getRemoteBrowser(id);
+
+    const result = await browserPool.deleteRemoteBrowser(id, userId);
     
     if (browserSession) {
       logger.log('debug', `Switching off the browser with id: ${id} for user: ${userId}`);
@@ -147,7 +152,7 @@ export const destroyRemoteBrowser = async (id: string, userId: string): Promise<
       await browserSession.switchOff();
     }
     
-    return await browserPool.deleteRemoteBrowser(id);
+    return result;
   } catch (error) {
     logger.log('error', `Error destroying remote browser ${id}: ${error}`);
     return false;

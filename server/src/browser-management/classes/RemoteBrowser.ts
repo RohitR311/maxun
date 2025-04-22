@@ -52,12 +52,12 @@ const REDIS_KEYS = {
 /**
  * The maximum duration of a recording session in milliseconds (10 minutes)
  */
-const MAX_SESSION_DURATION = 1.5 * 60 * 1000;
+const MAX_SESSION_DURATION = 1 * 60 * 1000;
 
 /**
  * The warning time before session ends in milliseconds (1 minute)
  */
-const WARNING_TIME = 1 * 60 * 1000;
+const WARNING_TIME = 0.5 * 60 * 1000;
 
 /**
  * This class represents a remote browser instance.

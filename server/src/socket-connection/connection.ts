@@ -11,11 +11,41 @@ interface AuthenticatedIncomingMessage extends IncomingMessage {
 interface AuthenticatedSocket extends Socket {
   request: AuthenticatedIncomingMessage;
 }
+
+declare global {
+  var userContextMap: Map<string, string>;
+}
+
+if (!global.userContextMap) {
+  global.userContextMap = new Map<string, string>();
+}
+
+export function registerBrowserUserContext(browserId: string, userId: string) {
+  if (!global.userContextMap) {
+    global.userContextMap = new Map<string, string>();
+  }
+  global.userContextMap.set(browserId, userId);
+  logger.log('debug', `Registered browser-user association: ${browserId} -> ${userId}`);
+}
+
 /**
  * Socket.io middleware for authentication
  * This is a socket.io specific auth handler that doesn't rely on Express middleware
  */
-const socketAuthMiddleware = (socket: Socket, next: (err?: Error) => void) => { 
+const socketAuthMiddleware = (socket: Socket, next: (err?: Error) => void) => {
+  const namespace = socket.nsp.name;
+  const browserId = namespace.slice(1); 
+  
+  // Check if this browser is in our context map
+  if (global.userContextMap && global.userContextMap.has(browserId)) {
+    const userId = global.userContextMap.get(browserId);
+    logger.log('debug', `Found browser in context map: ${browserId} -> ${userId}`);
+    
+    const authSocket = socket as AuthenticatedSocket;
+    authSocket.request.user = { id: userId };
+    return next(); 
+  }
+
   const cookies = socket.handshake.headers.cookie;
   if (!cookies) {
     logger.log('debug', `No cookies found in socket handshake`);

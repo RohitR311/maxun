@@ -433,43 +433,83 @@ export default class Interpreter extends EventEmitter {
       scrapeSchema: async (schema: Record<string, { selector: string; tag: string, attribute: string; shadow: string}>) => {
         await this.ensureScriptsLoaded(page);
       
-        const scrapeResult = await page.evaluate((schemaObj) => window.scrapeSchema(schemaObj), schema);
-      
-        const newResults = Array.isArray(scrapeResult) ? scrapeResult : [scrapeResult];
-        newResults.forEach((result) => {
-          Object.entries(result).forEach(([key, value]) => {
+        // Create a unique identifier for this schema scraping operation
+        const schemaHash = JSON.stringify(schema);
+        
+        try {
+          // Execute the schema scraping on the page
+          const scrapeResult = await page.evaluate((schemaObj) => window.scrapeSchema(schemaObj), schema);
+          
+          // Convert to array if it's not already an array
+          const newResults = Array.isArray(scrapeResult) ? scrapeResult : [scrapeResult];
+          
+          // Initialize cumulativeResults if it doesn't exist
+          if (!this.cumulativeResults || !Array.isArray(this.cumulativeResults)) {
+            this.cumulativeResults = [];
+          }
+          
+          // Process each result item and merge with cumulative results
+          newResults.forEach((result) => {
+            Object.entries(result).forEach(([key, value]) => {
+              // Check if this key already exists in cumulative results
               const keyExists = this.cumulativeResults.some(
-                  (item) => key in item && item[key] !== undefined
+                (item) => key in item && item[key] !== undefined
               );
-  
+      
+              // If the key doesn't exist yet, add it
               if (!keyExists) {
-                  this.cumulativeResults.push({ [key]: value });
+                this.cumulativeResults.push({ [key]: value });
+              } else {
+                // If the key exists but the value is undefined or empty, update it
+                const existingItem = this.cumulativeResults.find(item => key in item);
+                if (existingItem && 
+                    (existingItem[key] === undefined || 
+                     existingItem[key] === null || 
+                     existingItem[key] === '')) {
+                  existingItem[key] = value;
+                }
               }
+            });
           });
-        });
-
-        const mergedResult: Record<string, string>[] = [
-          Object.fromEntries( 
-            Object.entries(
-              this.cumulativeResults.reduce((acc, curr) => {
-                Object.entries(curr).forEach(([key, value]) => {
-                  // If the key doesn't exist or the current value is not undefined, add/update it
-                  if (value !== undefined) {
-                    acc[key] = value;
-                  }
-                });
-                return acc;
-              }, {})
-            )
-          )
-        ];
-
-        // Log cumulative results after each action
-        console.log("CUMULATIVE results:", this.cumulativeResults);
-        console.log("MERGED results:", mergedResult);
-
-        await this.options.serializableCallback(mergedResult);
-        // await this.options.serializableCallback(scrapeResult);
+      
+          // Create merged result by combining all items from cumulativeResults
+          const mergedResult: Record<string, any> = this.cumulativeResults.reduce(
+            (acc, curr) => {
+              Object.entries(curr).forEach(([key, value]) => {
+                // Only add/update if the value is not undefined
+                if (value !== undefined) {
+                  acc[key] = value;
+                }
+              });
+              return acc;
+            }, 
+            {}
+          );
+      
+          // Log for debugging
+          console.log("CUMULATIVE results:", this.cumulativeResults);
+          console.log("MERGED results:", mergedResult);
+      
+          // Return the final merged result
+          await this.options.serializableCallback([mergedResult]);
+          return [mergedResult];
+        } catch (error) {
+          console.error("Error in scrapeSchema:", error);
+          
+          // If there's an error, return the current cumulative results if any
+          if (this.cumulativeResults && this.cumulativeResults.length > 0) {
+            const mergedResult = this.cumulativeResults.reduce(
+              (acc, curr) => ({ ...acc, ...curr }), 
+              {}
+            );
+            await this.options.serializableCallback([mergedResult]);
+            return [mergedResult];
+          }
+          
+          // If no cumulative results, just return an empty result
+          await this.options.serializableCallback([{}]);
+          return [{}];
+        }
       },
 
       scrapeList: async (config: { listSelector: string, fields: any, limit?: number, pagination: any }) => {
@@ -586,10 +626,8 @@ export default class Interpreter extends EventEmitter {
     },
     scrapingId?: string,
     checkpoint?: ScrapingCheckpoint | null,
-    timeoutMs: number = 30000
   ): Promise<{ results: Record<string, any>[], checkpoint: ScrapingCheckpoint, completed: boolean }> {
     const localScrapingId = scrapingId || `scraping-${Date.now()}`;
-    const startTime = Date.now();
     
     let allResults: Record<string, any>[] = checkpoint?.results || [];
     let previousHeight = checkpoint?.paginationState?.currentHeight || 0;
@@ -600,34 +638,58 @@ export default class Interpreter extends EventEmitter {
     const MAX_RETRIES = 3;
     const RETRY_DELAY = 1000; // 1 second delay between retries
     const MAX_UNCHANGED_RESULTS = 5;
+
+    let currentScrollPosition = 0;
   
     if (checkpoint?.pageUrl && page.url() !== checkpoint.pageUrl) {
       this.log(`Navigating to checkpoint URL: ${checkpoint.pageUrl}`, Level.LOG);
-      await page.goto(checkpoint.pageUrl, { waitUntil: 'networkidle' });
+      try {
+        await page.goto(checkpoint.pageUrl, { waitUntil: 'networkidle' }).catch(async error => {
+          this.log(`Error navigating to checkpoint URL, trying with longer timeout: ${error.message}`, Level.WARN);
+          await page.goto(checkpoint.pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        });
+      } catch (e) {
+        this.log(`Failed to navigate to checkpoint URL: ${checkpoint.pageUrl}. Continuing with current page.`, Level.ERROR);
+      }
     }
     
     if (checkpoint?.scrollPosition) {
       this.log(`Restoring scroll position: ${checkpoint.scrollPosition}`, Level.LOG);
-      await page.evaluate((position) => {
-        window.scrollTo(0, position);
-      }, checkpoint.scrollPosition);
-      await page.waitForTimeout(1000); // Wait for scroll to complete
+      let currentScrollHeight = 0;
+      while (currentScrollHeight < checkpoint?.scrollPosition) {
+        try {
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await page.waitForTimeout(500);
+
+          currentScrollHeight = await page.evaluate(() => document.body.scrollHeight);
+          console.log("Current scroll height:", currentScrollHeight);
+        } catch (e) {
+          this.log(`Failed to restore scroll position: ${e.message}`, Level.ERROR);
+          break;
+        }
+      }
     }
   
     const debugLog = (message: string, ...args: any[]) => {
       this.log(`[ScrapingID: ${localScrapingId}] ${message} ${args.join(' ')}`, Level.LOG);
     };
   
-    const scrapeCurrentPage = async () => {
-      const results = await page.evaluate((cfg) => window.scrapeList(cfg), config);
-      const newResults = results.filter(item => {
-        const uniqueKey = JSON.stringify(item);
-        if (scrapedItems.has(uniqueKey)) return false;
-        scrapedItems.add(uniqueKey);
-        return true;
-      });
-      allResults = allResults.concat(newResults);
-      debugLog(`Results collected: ${allResults.length} total (${newResults.length} new)`);
+    const scrapeCurrentPage = async (): Promise<boolean> => {
+      try {
+        const results = await page.evaluate((cfg) => window.scrapeList(cfg), config);
+        const newResults = results.filter(item => {
+          const uniqueKey = JSON.stringify(item);
+          if (scrapedItems.has(uniqueKey)) return false;
+          scrapedItems.add(uniqueKey);
+          return true;
+        });
+        allResults = allResults.concat(newResults);
+        debugLog(`Results collected: ${allResults.length} total (${newResults.length} new)`);
+        return newResults.length > 0;
+      } catch (error) {
+        debugLog(`Error scraping current page: ${error.message}`);
+        return false;
+      }
     };
   
     const checkLimit = () => {
@@ -637,8 +699,25 @@ export default class Interpreter extends EventEmitter {
       }
       return false;
     };
+    
+    // Function to create checkpoint at any point
+    const createCurrentCheckpoint = (isCompleted: boolean): ScrapingCheckpoint => {
+      return {
+        scrapingId: localScrapingId,
+        pageUrl: page.url(),
+        scrapedItems: Array.from(scrapedItems),
+        scrollPosition: currentScrollPosition,
+        results: allResults,
+        isComplete: isCompleted,
+        paginationState: {
+          availableSelectors,
+          currentHeight: previousHeight,
+          unchangedResultCounter,
+          visitedUrls: Array.from(visitedUrls)
+        }
+      };
+    };
   
-    // Enhanced button finder with retry mechanism
     const findWorkingButton = async (selectors: string[]): Promise<{ 
       button: ElementHandle | null, 
       workingSelector: string | null,
@@ -691,35 +770,23 @@ export default class Interpreter extends EventEmitter {
     let unchangedResultCounter = checkpoint?.paginationState?.unchangedResultCounter || 0;
     let isComplete = checkpoint?.isComplete || false;
   
-    debugLog(`Starting pagination handling. Timeout: ${timeoutMs}ms, Starting with ${allResults.length} results`);
+    debugLog(`Starting with ${allResults.length} results`);
+    
     if (checkpoint) {
-      debugLog(`Resuming from checkpoint. URL: ${checkpoint.pageUrl}, Scroll position: ${checkpoint.scrollPosition}`);
+      debugLog(`Resuming from checkpoint. URL: ${checkpoint.pageUrl}, Scroll position: ${checkpoint.scrollPosition}, Items: ${checkpoint.scrapedItems.length}`);
     }
   
     if (isComplete) {
       debugLog('Checkpoint indicates scraping is already complete.');
       return {
         results: allResults,
-        checkpoint: {
-          scrapingId: localScrapingId,
-          pageUrl: page.url(),
-          scrapedItems: Array.from(scrapedItems),
-          scrollPosition: checkpoint?.scrollPosition || 0,
-          results: allResults,
-          isComplete: true,
-          paginationState: {
-            availableSelectors,
-            currentHeight: previousHeight,
-            unchangedResultCounter,
-            visitedUrls: Array.from(visitedUrls)
-          }
-        },
+        checkpoint: createCurrentCheckpoint(true),
         completed: true
       };
     }
-  
+
     try {
-      while (Date.now() - startTime < timeoutMs && !isComplete) {    
+      while (true) {    
         switch (config.pagination.type) {
           case 'scrollDown': {
             let previousResultCount = allResults.length;
@@ -728,14 +795,33 @@ export default class Interpreter extends EventEmitter {
             
             if (checkLimit()) {
               debugLog('Reached configured limit. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(true),
+                completed: true
+              }
             }
   
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-            await page.waitForTimeout(2000);
-  
-            const currentHeight = await page.evaluate(() => document.body.scrollHeight);
+            try {
+              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+              await page.waitForTimeout(2000);
+              
+              // Update current position for checkpoint
+              currentScrollPosition = await page.evaluate(() => document.body.scrollHeight);
+            } catch (error) {
+              debugLog(`Error scrolling down: ${error.message}`);
+              // Continue even if scroll fails
+            }
+              
+            let currentHeight;
+            try {
+              currentHeight = await page.evaluate(() => document.body.scrollHeight);
+            } catch (error) {
+              debugLog(`Error getting page height: ${error.message}`);
+              // Use previous height if we can't get current height
+              currentHeight = previousHeight;
+            }
+
             const currentResultCount = allResults.length;
             
             if (currentResultCount === previousResultCount) {
@@ -744,8 +830,11 @@ export default class Interpreter extends EventEmitter {
               
               if (unchangedResultCounter >= MAX_UNCHANGED_RESULTS) {
                 debugLog('Reached maximum unchanged results. Marking as complete.');
-                isComplete = true;
-                break;
+                return {
+                  results: allResults,
+                  checkpoint: createCurrentCheckpoint(false),
+                  completed: false
+                }
               }
             } else {
               unchangedResultCounter = 0;
@@ -753,16 +842,14 @@ export default class Interpreter extends EventEmitter {
             
             if (currentHeight === previousHeight) {
               debugLog('Page height unchanged after scroll. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(false),
+                completed: false
+              }
             }
   
             previousHeight = currentHeight;
-            
-            if (Date.now() - startTime > timeoutMs - 5000) {
-              debugLog("Approaching timeout, will save checkpoint and continue later");
-              break; 
-            }
             break;
           }
   
@@ -773,22 +860,44 @@ export default class Interpreter extends EventEmitter {
             
             if (checkLimit()) {
               debugLog('Reached configured limit. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(true),
+                completed: true
+              }
             }
   
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await page.waitForTimeout(2000);
-  
-            const currentTopHeight = await page.evaluate(() => document.documentElement.scrollTop);
+            try {
+              await page.evaluate(() => window.scrollTo(0, 0));
+              await page.waitForTimeout(2000);
+              
+              // Update current position for checkpoint
+              currentScrollPosition = await page.evaluate(() => document.documentElement.scrollTop || 0);
+            } catch (error) {
+              debugLog(`Error scrolling up: ${error.message}`);
+              // Continue even if scroll fails
+            }
+
+            let currentTopHeight;
+            try {
+              currentTopHeight = await page.evaluate(() => document.documentElement.scrollTop);
+            } catch (error) {
+              debugLog(`Error getting scroll position: ${error.message}`);
+              // Use 0 if we can't get current position
+              currentTopHeight = 0;
+            }
+
             const currentResultCount = allResults.length;
             
             if (currentResultCount === previousResultCount) {
               unchangedResultCounter++;              
               if (unchangedResultCounter >= MAX_UNCHANGED_RESULTS) {
                 debugLog('Reached maximum unchanged results. Marking as complete.');
-                isComplete = true;
-                break;
+                return {
+                  results: allResults,
+                  checkpoint: createCurrentCheckpoint(true),
+                  completed: true
+                }
               }
             } else {
               unchangedResultCounter = 0;
@@ -796,46 +905,64 @@ export default class Interpreter extends EventEmitter {
   
             if (currentTopHeight === 0) {
               debugLog('Reached top of page. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(true),
+                completed: true
+              }
             }
   
             previousHeight = currentTopHeight;
-            
-            if (Date.now() - startTime > timeoutMs - 5000) {
-              debugLog("Approaching timeout, will save checkpoint and continue later");
-              break;
-            }
             break;
           }
   
           case 'clickNext': {
-            const currentUrl = page.url();
-            visitedUrls.add(currentUrl);
+            let currentUrl;
+            try {
+              currentUrl = page.url();
+              visitedUrls.add(currentUrl);
+            } catch (error) {
+              debugLog(`Error getting page URL: ${error.message}`);
+              currentUrl = "unknown";
+            }
             
             await scrapeCurrentPage();
             
             if (checkLimit()) {
               debugLog('Reached configured limit. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(true),
+                completed: true
+              }
             }
           
-            const { button, workingSelector, updatedSelectors } = await findWorkingButton(availableSelectors);
+            let buttonResult;
+            try {
+              buttonResult = await findWorkingButton(availableSelectors);
+              availableSelectors = buttonResult.updatedSelectors;
+            } catch (error) {
+              debugLog(`Error finding next button: ${error.message}`);
+              buttonResult = { button: null, workingSelector: null, updatedSelectors: availableSelectors };
+            }
             
-            availableSelectors = updatedSelectors;
+            const { button, workingSelector } = buttonResult;
           
             if (!button || !workingSelector) {
               debugLog('No pagination button found. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(false),
+                completed: false
+              }
             }
           
             let retryCount = 0;
             let paginationSuccess = false;
             
-            const captureContentSignature = async () => {
-              return await page.evaluate((selector) => {
+            let beforeSignature = null;
+            try {
+              beforeSignature = await page.evaluate((selector) => {
                 const items = document.querySelectorAll(selector);
                 return {
                   url: window.location.href,
@@ -843,10 +970,11 @@ export default class Interpreter extends EventEmitter {
                   firstItems: Array.from(items).slice(0, 3).map(el => el.textContent || '').join('|')
                 };
               }, config.listSelector);
-            };
-          
-            const beforeSignature = await captureContentSignature();
-            debugLog(`Before click: ${beforeSignature.itemCount} items`);
+              debugLog(`Before click: ${beforeSignature.itemCount} items`);
+            } catch (error) {
+              debugLog(`Error capturing content signature: ${error.message}`);
+              beforeSignature = { url: currentUrl, itemCount: 0, firstItems: '' };
+            }
           
             while (retryCount < MAX_RETRIES && !paginationSuccess) {
               try {
@@ -886,19 +1014,39 @@ export default class Interpreter extends EventEmitter {
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
                 
                 if (!paginationSuccess) {
-                  const newUrl = page.url();
-                  const afterSignature = await captureContentSignature();
+                  let newUrl;
+                  try {
+                    newUrl = page.url();
+                  } catch (error) {
+                    debugLog(`Error getting new URL: ${error.message}`);
+                    newUrl = currentUrl;
+                  }
+
+                  let afterSignature = null;
+                  try {
+                    afterSignature = await page.evaluate((selector) => {
+                      const items = document.querySelectorAll(selector);
+                      return {
+                        url: window.location.href,
+                        itemCount: items.length,
+                        firstItems: Array.from(items).slice(0, 3).map(el => el.textContent || '').join('|')
+                      };
+                    }, config.listSelector);
+                  } catch (error) {
+                    debugLog(`Error capturing after signature: ${error.message}`);
+                    afterSignature = { url: newUrl, itemCount: 0, firstItems: '' };
+                  }
                   
                   if (newUrl !== currentUrl) {
                     debugLog(`URL changed to ${newUrl}`);
                     visitedUrls.add(newUrl);
                     paginationSuccess = true;
                   } 
-                  else if (afterSignature.firstItems !== beforeSignature.firstItems) {
+                  else if (afterSignature && beforeSignature && afterSignature.firstItems !== beforeSignature.firstItems) {
                     debugLog("Content changed without URL change");
                     paginationSuccess = true;
                   }
-                  else if (afterSignature.itemCount !== beforeSignature.itemCount) {
+                  else if (afterSignature && beforeSignature && afterSignature.itemCount !== beforeSignature.itemCount) {
                     debugLog(`Item count changed from ${beforeSignature.itemCount} to ${afterSignature.itemCount}`);
                     paginationSuccess = true;
                   }
@@ -918,14 +1066,11 @@ export default class Interpreter extends EventEmitter {
           
             if (!paginationSuccess) {
               debugLog(`Pagination failed after ${MAX_RETRIES} attempts. Marking as complete.`);
-              isComplete = true;
-              break;
-            }
-            
-            // Check if we're approaching timeout
-            if (Date.now() - startTime > timeoutMs - 5000) {
-              debugLog("Approaching timeout, will save checkpoint and continue later");
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(false),
+                completed: false
+              }
             }
             
             break;
@@ -936,19 +1081,32 @@ export default class Interpreter extends EventEmitter {
             
             if (checkLimit()) {
               debugLog('Reached configured limit. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(true),
+                completed: true
+              }
             }
             
             // Find Load More button
-            const { button: loadMoreButton, workingSelector, updatedSelectors } = await findWorkingButton(availableSelectors);
-  
-            availableSelectors = updatedSelectors;
+            let buttonResult;
+            try {
+              buttonResult = await findWorkingButton(availableSelectors);
+              availableSelectors = buttonResult.updatedSelectors;
+            } catch (error) {
+              debugLog(`Error finding load more button: ${error.message}`);
+              buttonResult = { button: null, workingSelector: null, updatedSelectors: availableSelectors };
+            }
+
+            const { button: loadMoreButton, workingSelector } = buttonResult;
             
             if (!workingSelector || !loadMoreButton) {
               debugLog('No working Load More selector found. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(false),
+                completed: false
+              }
             }
         
             // Try to click the button
@@ -990,16 +1148,33 @@ export default class Interpreter extends EventEmitter {
         
             if (!clickSuccess) {
               debugLog(`Load More clicking failed after ${MAX_RETRIES} attempts. Marking as complete.`);
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(false),
+                completed: false
+              }
             }
         
             // Wait for content to load and check scroll height
             await page.waitForTimeout(2000);
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-            await page.waitForTimeout(2000);
+            try {
+              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+              await page.waitForTimeout(2000);
+              
+              // Update current position for checkpoint
+              currentScrollPosition = await page.evaluate(() => window.scrollY || document.documentElement.scrollTop || 0);
+            } catch (error) {
+              debugLog(`Error scrolling to bottom: ${error.message}`);
+            }
         
-            const currentHeight = await page.evaluate(() => document.body.scrollHeight);
+            let currentHeight;
+            try {
+              currentHeight = await page.evaluate(() => document.body.scrollHeight);
+            } catch (error) {
+              debugLog(`Error getting page height: ${error.message}`);
+              currentHeight = previousHeight;
+            }
+
             const heightChanged = currentHeight !== previousHeight;
             previousHeight = currentHeight;
             
@@ -1015,8 +1190,11 @@ export default class Interpreter extends EventEmitter {
               
               if (unchangedResultCounter >= MAX_UNCHANGED_RESULTS) {
                 debugLog(`Stopping after ${MAX_UNCHANGED_RESULTS} clicks with no new items. Marking as complete.`);
-                isComplete = true;
-                break;
+                return {
+                  results: allResults,
+                  checkpoint: createCurrentCheckpoint(false),
+                  completed: false
+                }
               }
             } else {
               unchangedResultCounter = 0;
@@ -1024,62 +1202,64 @@ export default class Interpreter extends EventEmitter {
             
             if (checkLimit()) {
               debugLog('Reached configured limit. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(true),
+                completed: true
+              }
             }
             
             if (!heightChanged) {
               debugLog('No more items loaded after Load More. Marking as complete.');
-              isComplete = true;
-              break;
+              return {
+                results: allResults,
+                checkpoint: createCurrentCheckpoint(false),
+                completed: false
+              }
             }
             
-            if (Date.now() - startTime > timeoutMs - 5000) {
-              debugLog("Approaching timeout, will save checkpoint and continue later");
-              break;
-            }
             break;
           }
   
           default: {
             await scrapeCurrentPage();
             debugLog('Using default pagination type. Marking as complete.');
-            isComplete = true;
-            break;
+            return {
+              results: allResults,
+              checkpoint: createCurrentCheckpoint(true),
+              completed: true
+            }
           }
         }
   
         if (isComplete || checkLimit()) break;
       }
     } catch (error) {
-      debugLog(`Fatal error during pagination: ${error.message}`);
-    }
-  
-    const currentScrollPosition = await page.evaluate(() => window.scrollY);
-    
-    const timedOut = Date.now() - startTime >= timeoutMs && !isComplete;
-    if (timedOut) {
-      debugLog("Scraping session timed out after 30 seconds. Creating checkpoint for continuation.");
-    }
-    
-    const newCheckpoint: ScrapingCheckpoint = {
-      scrapingId: localScrapingId,
-      pageUrl: page.url(),
-      scrapedItems: Array.from(scrapedItems),
-      scrollPosition: currentScrollPosition,
-      results: allResults,
-      isComplete,
-      paginationState: {
-        availableSelectors,
-        currentHeight: previousHeight,
-        unchangedResultCounter,
-        visitedUrls: Array.from(visitedUrls)
+      debugLog(`Error during pagination: ${error.message}`);
+      // Even on error, return a checkpoint with current state
+      return {
+        results: allResults,
+        checkpoint: createCurrentCheckpoint(false),
+        completed: false
       }
-    };
+    } 
+
+    // Try to get final scroll position, but don't fail if it errors
+    try {
+      currentScrollPosition = await page.evaluate(() => window.scrollY || document.documentElement.scrollTop || 0);
+    } catch (e) {
+      debugLog(`Error getting final scroll position: ${e.message}`);
+      // Use last known position or 0
+      currentScrollPosition = currentScrollPosition || 0;
+    }
+    
+    // Create final checkpoint using the consistent function
+    const finalCheckpoint = createCurrentCheckpoint(isComplete);
+    debugLog(`Returning ${allResults.length} results with checkpoint. Scraping complete: ${isComplete}`);
   
     return {
       results: allResults,
-      checkpoint: newCheckpoint,
+      checkpoint: finalCheckpoint,
       completed: isComplete
     };
   }
@@ -1241,7 +1421,7 @@ export default class Interpreter extends EventEmitter {
     }
   }
 
-  private async ensureScriptsLoaded(page: Page) {
+  public async ensureScriptsLoaded(page: Page) {
     const isScriptLoaded = await page.evaluate(() => typeof window.scrape === 'function' && typeof window.scrapeSchema === 'function' && typeof window.scrapeList === 'function' && typeof window.scrapeListAuto === 'function' && typeof window.scrollDown === 'function' && typeof window.scrollUp === 'function');
     if (!isScriptLoaded) {
       await page.addInitScript({ path: path.join(__dirname, 'browserSide', 'scraper.js') });
