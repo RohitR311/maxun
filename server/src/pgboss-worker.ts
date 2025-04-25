@@ -125,6 +125,38 @@ async function checkAndProcessQueuedRun(userId: string, browserId: string): Prom
   }
 }
 
+async function getMergedResultsFromMinio(runId: string) {
+  const scrapingStateService = new ScrapingStateService();
+  
+  // Get all scraping IDs used in this run
+  const scrapingIds = await scrapingStateService.getAllScrapingIds(runId);
+  console.log(`Found ${scrapingIds.length} scraping operations for run ${runId}`);
+  
+  const mergedResults: Record<string, any> = {};
+  
+  // For each scraping operation, merge its results
+  for (const scrapingId of scrapingIds) {
+    // Check if this is a schema scraping or list scraping based on ID prefix
+    if (scrapingId.startsWith('schema-scraping-')) {
+      // For schema scraping, merge schema results
+      const schemaResults = await scrapingStateService.mergeSchemaScrapingResults(runId, scrapingId);
+      mergedResults[scrapingId] = schemaResults;
+    } else {
+      // For list scraping, merge list results
+      const listResults = await scrapingStateService.mergeScrapingResults(runId, scrapingId);
+      mergedResults[scrapingId] = listResults;
+    }
+  }
+  
+  // Format the results to match the expected structure
+  const formattedResults: Record<string, any> = {};
+  Object.entries(mergedResults).forEach(([scrapingId, results], index) => {
+    formattedResults[`item-${index}`] = results;
+  });
+  
+  return formattedResults;
+}
+
 export async function processRunExecution(data: ExecuteRunData) {
   try {
     logger.log('info', `Processing run execution for runId: ${data.runId}, browserId: ${data.browserId}`);
@@ -281,18 +313,24 @@ export async function processRunExecution(data: ExecuteRunData) {
           (newPage: Page) => currentPage = newPage, 
           plainRun.interpreterSettings
         );
+
+        const scrapingStateService = new ScrapingStateService();
+
+        const currentState = interpretationInfo.currentScrapingState;
+        if (currentState && currentState.scrapingId) {
+          const serializableOutput = interpretationInfo.serializableOutput as Record<string, any>;
+          await scrapingStateService.storeScrapingResults(
+            data.runId,
+            currentState.scrapingId,
+            serializableOutput["item-0"] || []
+          );
+        }
         
         // Check if scraping is complete
         isScrapingComplete = interpretationInfo.scrapingCompleted === true;
         
         // Add logs from this browser iteration
         allLogs = [...allLogs, ...interpretationInfo.log];
-        
-        // Merge serializable and binary outputs
-        accumulatedSerializableOutput = {
-          ...accumulatedSerializableOutput,
-          ...interpretationInfo.serializableOutput
-        };
         
         accumulatedBinaryOutput = {
           ...accumulatedBinaryOutput,
@@ -304,11 +342,12 @@ export async function processRunExecution(data: ExecuteRunData) {
           status: isScrapingComplete ? 'success' : 'running',
           browserId: currentBrowserId,
           log: allLogs.join('\n'),
-          serializableOutput: accumulatedSerializableOutput
         });
         
         // Update Redis status
         if (isScrapingComplete) {
+          const mergedSerializableOutput = await getMergedResultsFromMinio(data.runId);
+
           // Process the final results
           const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
           const uploadedBinaryOutput = await binaryOutputService.uploadAndStoreBinaryOutput(run, accumulatedBinaryOutput);
@@ -317,6 +356,7 @@ export async function processRunExecution(data: ExecuteRunData) {
           await run.update({
             status: 'success',
             finishedAt: new Date().toLocaleString(),
+            serializableOutput: mergedSerializableOutput,
             binaryOutput: uploadedBinaryOutput,
           });
           
